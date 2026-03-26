@@ -189,9 +189,6 @@ if __name__ == "__main__":
     ax.init(
         G_data=args.G_data,
         G_inter=args.G_inter,
-        mixed_precision=True,
-        fp16_allreduce=True,
-        cpu_offload=cpu_offload,
     )
 
     ilp_rank = ax.config.inter_layer_parallel_rank

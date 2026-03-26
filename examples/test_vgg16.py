@@ -21,7 +21,7 @@ def test_vgg_imagenet():
     mbs = bs_per_gpu
     epochs = 10
 
-    ax.init(G_data=num_gpus, G_inter=1, mixed_precision=False)
+    ax.init(G_data=num_gpus, G_inter=1)
     ax.print_status(f"Running on {num_gpus} gpus")
 
     ilp_rank = ax.config.inter_layer_parallel_rank
