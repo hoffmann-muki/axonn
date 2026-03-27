@@ -107,9 +107,6 @@ def train_vgg16_distributed():
             # Backward pass (gradient synchronization occurs automatically via NCCL)
             loss.backward()
 
-            # This prevents exploding gradients by clipping them to a maximum norm of 1.0
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
             # Parameter update
             optimizer.step()
 
