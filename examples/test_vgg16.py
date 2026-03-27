@@ -24,6 +24,7 @@ from tqdm import tqdm
 
 from axonn import axonn as ax
 
+from torch.optim.lr_scheduler import LinearLR, SequentialLR, CosineAnnealingLR
 
 def train_vgg16_distributed():
     """
@@ -59,13 +60,22 @@ def train_vgg16_distributed():
 
     # Instantiate model and training components
     model = models.vgg16().cuda()
-    loss_fn = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, eps=1e-6)
+
+    # Learning rate scheduler with warmup
+    # We ramp up for 1 epoch then decay
+    warmup_steps = 18 
+    total_steps = 18 * num_epochs
+    
+    scheduler1 = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
+    scheduler2 = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
+    scheduler = SequentialLR(optimizer, schedulers=[scheduler1, scheduler2], milestones=[warmup_steps])
 
     # Construct distributed dataloader
     # ax.create_dataloader handles data sharding across data-parallel ranks
     train_dataset = torchvision.datasets.FakeData(
-        size=64 * 12 * 12,
+        size=64 * 12 * 12, # 9216 samples / 512 global batch = 18 iterations per epoch
         image_size=(3, 224, 224),
         num_classes=1000,
         transform=ToTensor(),
@@ -81,7 +91,6 @@ def train_vgg16_distributed():
     for epoch in range(num_epochs):
         epoch_loss = 0.0
         epoch_start = time.time()
-        batch_losses = []
 
         for batch_idx, (x, y) in enumerate(tqdm(
             train_dataloader,
@@ -95,38 +104,33 @@ def train_vgg16_distributed():
             optimizer.zero_grad()
             logits = model(x)
             loss = loss_fn(logits, y)
-
             # Backward pass (gradient synchronization occurs automatically via NCCL)
             loss.backward()
+
+            # This prevents exploding gradients by clipping them to a maximum norm of 1.0
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
             # Parameter update
             optimizer.step()
 
+            # Update the learning rate every batch
+            scheduler.step()
+
             batch_loss = loss.item()
-            batch_losses.append(batch_loss)
             epoch_loss += batch_loss
 
             # Log per-batch loss for rank 0
             if rank == 0:
-                print(f"  Batch {batch_idx + 1}: loss = {batch_loss:.6f}")
+                current_lr = optimizer.param_groups[0]['lr']
+                print(f"  Batch {batch_idx + 1}: loss = {batch_loss:.6f} | LR = {current_lr:.6e}")
 
         # Rank 0 reports epoch statistics
         if rank == 0:
             avg_loss = epoch_loss / len(train_dataloader)
-            epoch_duration = time.time() - epoch_start
-            print(
-                f"Epoch {epoch + 1}: "
-                f"Average loss = {avg_loss:.4f}, "
-                f"Duration = {epoch_duration:.2f}s"
-            )
-
-    if rank == 0:
-        print("Training procedure completed.")
+            print(f"Epoch {epoch + 1}: Average loss = {avg_loss:.4f}, Duration = {time.time() - epoch_start:.2f}s")
 
     # Clean up distributed process group
     dist.destroy_process_group()
-
-
 
 
 if __name__ == "__main__":
