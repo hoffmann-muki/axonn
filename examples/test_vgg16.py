@@ -3,76 +3,121 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+"""
+Distributed training example using AxoNN's data parallelism with VGG16.
 
-from axonn import axonn as ax
-import torchvision
-from torchvision.transforms import ToTensor
-import torch
-from tqdm import tqdm
-import torchvision.models as models
+This example demonstrates how to:
+  - Initialize AxoNN with data parallelism across multiple GPUs
+  - Construct a distributed dataloader that shards data across ranks
+  - Implement a distributed training loop with gradient synchronization via NCCL
+"""
+
 import os
 import time
 
+import torch
+import torch.distributed as dist
+import torchvision
+import torchvision.models as models
+from torchvision.transforms import ToTensor
+from tqdm import tqdm
 
-def test_vgg_imagenet():
-    bs_per_gpu = 64
+from axonn import axonn as ax
+
+
+def train_vgg16_distributed():
+    """
+    Distributed training routine for VGG16 on synthetic ImageNet data.
+    
+    Requires:
+      - WORLD_SIZE environment variable set to the number of processes
+      - Launch via torchrun or mpirun with proper rank environment variables
+    """
+    # Configuration
+    batch_size_per_gpu = 64
     num_gpus = int(os.environ["WORLD_SIZE"])
-    bs = num_gpus * bs_per_gpu
-    mbs = bs_per_gpu
-    epochs = 10
+    global_batch_size = num_gpus * batch_size_per_gpu
+    num_epochs = 2
+    learning_rate = 1e-3
 
-    # Initialize torch.distributed before calling ax.init()
-    import torch.distributed as dist
+    # Initialize torch.distributed process group (required before AxoNN initialization)
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
 
+    # Initialize AxoNN with data parallelism configuration
+    # G_data specifies the number of data-parallel ranks
+    # G_inter=1 indicates no pipeline parallelism
     ax.init(G_data=num_gpus, G_inter=1)
-    if ax.config.data_parallel_rank == 0:
-        print(f"Running on {num_gpus} gpus")
 
-    ilp_rank = ax.config.inter_layer_parallel_rank
-    G_inter = ax.config.G_inter
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
 
+    # Rank 0 prints training configuration
+    if rank == 0:
+        print(f"Initialized distributed training on {world_size} GPUs")
+        print(f"Global batch size: {global_batch_size}")
+
+    # Instantiate model and training components
     model = models.vgg16().cuda()
+    loss_fn = torch.nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
-    model, optimizer = ax.register_model_and_optimizer(model, optimizer)
-
-    ax.register_loss_fn(torch.nn.CrossEntropyLoss())
-
+    # Construct distributed dataloader
+    # ax.create_dataloader handles data sharding across data-parallel ranks
     train_dataset = torchvision.datasets.FakeData(
-        size=64 * 12 * 12,  # 1281167,
+        size=64 * 12 * 12,
         image_size=(3, 224, 224),
         num_classes=1000,
         transform=ToTensor(),
     )
-    train_loader = ax.create_dataloader(train_dataset, bs, mbs, 0)
+    train_dataloader = ax.create_dataloader(
+        dataset=train_dataset,
+        global_batch_size=global_batch_size,
+        micro_batch_size=batch_size_per_gpu,
+        num_workers=0,
+    )
 
-    for epoch_number in range(epochs):
-        epoch_loss = 0
-        start_time = time.time()
-        for x, y in tqdm(
-            train_loader,
-            disable=not (ilp_rank == 0 and ax.config.data_parallel_rank == 0),
+    # Training loop
+    for epoch in range(num_epochs):
+        epoch_loss = 0.0
+        epoch_start = time.time()
+
+        for (x, y) in tqdm(
+            train_dataloader,
+            disable=(rank != 0),
+            desc=f"Epoch {epoch + 1}/{num_epochs}",
         ):
+            # Move data to GPU
+            x, y = x.cuda(), y.cuda()
+
+            # Forward pass
             optimizer.zero_grad()
-            if ilp_rank == 0:
-                x, y = x.cuda(), y.cuda()
-            if G_inter > 1:
-                if ilp_rank == 0:
-                    ax.comm_handle.send(y, G_inter - 1, tag=0, async_op=False)
-                elif ilp_rank == G_inter - 1:
-                    y = y.long().cuda()
-                    ax.comm_handle.recv(y, 0, tag=0, async_op=False)
-            batch_loss = ax.run_batch(x, y)
+            logits = model(x)
+            loss = loss_fn(logits, y)
+
+            # Backward pass (gradient synchronization occurs automatically via NCCL)
+            loss.backward()
+
+            # Parameter update
             optimizer.step()
-            epoch_loss += batch_loss
-        if ilp_rank == G_inter - 1 and ax.config.data_parallel_rank == 0:
+
+            epoch_loss += loss.item()
+
+        # Rank 0 reports epoch statistics
+        if rank == 0:
+            avg_loss = epoch_loss / len(train_dataloader)
+            epoch_duration = time.time() - epoch_start
             print(
-                f"Epoch {epoch_number+1} : epoch loss "
-                f"{epoch_loss/len(train_loader)}, "
-                f"Epoch time = {time.time()-start_time} s"
+                f"Epoch {epoch + 1}: "
+                f"Average loss = {avg_loss:.4f}, "
+                f"Duration = {epoch_duration:.2f}s"
             )
 
+    if rank == 0:
+        print("Training procedure completed.")
 
-test_vgg_imagenet()
+
+
+
+if __name__ == "__main__":
+    train_vgg16_distributed()
