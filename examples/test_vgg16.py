@@ -124,6 +124,11 @@ def load_tiny_imagenet_dataset(split="train", local_cache_dir=None):
             image = item["image"]
             label = item["label"]
             
+            # Convert to RGB to handle grayscale images
+            # (Tiny ImageNet contains both RGB and grayscale images)
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+            
             if self.transform:
                 image = self.transform(image)
                 
