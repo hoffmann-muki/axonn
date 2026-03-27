@@ -115,12 +115,12 @@ def run_epoch(dataloader, optimizer, eval_mode=False):
                 ax.comm_handle.recv(trg, 0, tag=0, async_op=False)
         epoch_loss += ax.run_batch(src, trg, eval_mode=eval_mode)
         if ilp_rank == 0:
-            ax.print_status(f"Compute time = {time.time() - start}s")
+            print(f"Compute time = {time.time() - start}s")
         if not eval_mode:
             optimizer.step()
         end = time.time()
         if ilp_rank == 0:
-            ax.print_status(f"Batch time = {end-start} s")
+            print(f"Batch time = {end-start} s")
         start = time.time()
     return epoch_loss / len(dataloader)
 
@@ -239,20 +239,22 @@ if __name__ == "__main__":
     for epoch_number in range(num_epochs):
         epoch_loss = run_epoch(train_loader, optimizer, eval_mode=False)
         if not log_memory:
-            ax.print_status(
-                f"With cpu_offload = {cpu_offload}, "
-                "Current memory utilisation = "
-                f"{torch.cuda.memory_allocated() /1e9} GB, "
-                "Max memory utilisation = "
-                f"{torch.cuda.max_memory_allocated() /1e9} GB, "
-            )
+            if ilp_rank == G_inter - 1 and ax.config.data_parallel_rank == 0:
+                print(
+                    f"With cpu_offload = {cpu_offload}, "
+                    "Current memory utilisation = "
+                    f"{torch.cuda.memory_allocated() /1e9} GB, "
+                    "Max memory utilisation = "
+                    f"{torch.cuda.max_memory_allocated() /1e9} GB"
+                )
             log_memory = True
         val_loss = run_epoch(val_loader, optimizer, eval_mode=True)
         if ilp_rank == G_inter - 1 and ax.config.data_parallel_rank == 0:
-            ax.print_status(
-                f"Epoch {epoch_number+1} : train loss"
+            print(
+                f"Epoch {epoch_number+1} : train loss "
                 f"{epoch_loss/len(train_loader)} | "
                 f"val loss = {val_loss} val ppl = {np.exp(val_loss)}"
             )
     test_ppl = np.exp(run_epoch(test_loader, optimizer, eval_mode=True))
-    ax.print_status(f"Final test ppl = {test_ppl}")
+    if ax.config.data_parallel_rank == 0:
+        print(f"Final test ppl = {test_ppl}")

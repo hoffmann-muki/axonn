@@ -27,7 +27,8 @@ def test_vgg_imagenet():
         dist.init_process_group(backend="nccl")
 
     ax.init(G_data=num_gpus, G_inter=1)
-    ax.print_status(f"Running on {num_gpus} gpus")
+    if ax.config.data_parallel_rank == 0:
+        print(f"Running on {num_gpus} gpus")
 
     ilp_rank = ax.config.inter_layer_parallel_rank
     G_inter = ax.config.G_inter
@@ -67,12 +68,10 @@ def test_vgg_imagenet():
             optimizer.step()
             epoch_loss += batch_loss
         if ilp_rank == G_inter - 1 and ax.config.data_parallel_rank == 0:
-            ax.print_status(
-                (
-                    f"Epoch {epoch_number+1} : epoch loss",
-                    f"{epoch_loss/len(train_loader)},",
-                    f"Epoch time = {time.time()-start_time} s",
-                )
+            print(
+                f"Epoch {epoch_number+1} : epoch loss "
+                f"{epoch_loss/len(train_loader)}, "
+                f"Epoch time = {time.time()-start_time} s"
             )
 
 
