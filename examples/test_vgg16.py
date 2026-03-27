@@ -21,6 +21,11 @@ def test_vgg_imagenet():
     mbs = bs_per_gpu
     epochs = 10
 
+    # Initialize torch.distributed before calling ax.init()
+    import torch.distributed as dist
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+
     ax.init(G_data=num_gpus, G_inter=1)
     ax.print_status(f"Running on {num_gpus} gpus")
 
