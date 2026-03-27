@@ -17,10 +17,10 @@ import time
 
 import torch
 import torch.distributed as dist
-import torchvision
 import torchvision.models as models
-from torchvision.transforms import ToTensor
+from torchvision import transforms
 from tqdm import tqdm
+from datasets import load_dataset
 
 from axonn import axonn as ax
 
@@ -55,6 +55,81 @@ def apply_topk_sparsification(model, ratio=0.05):
         
         # Replace the original gradient with the sparsified dense version
         p.grad.copy_(new_grad.view(p.grad.shape))
+
+
+def load_tiny_imagenet_dataset(split="train", local_cache_dir=None):
+    """
+    Load Tiny ImageNet dataset using Hugging Face `datasets`.
+
+    This function will prefer a local cache directory when provided or when
+    a conventional local cache path exists inside the repository
+    (`./zh-plus___tiny-imagenet/default/0.0.0`). If no local cache is found
+    it falls back to loading from the Hugging Face Hub.
+
+    Arguments:
+        split (str): 'train' for training set, 'valid' for validation set
+        local_cache_dir (str|None): Optional path to a local HF datasets cache
+
+    Returns:
+        Dataset with images and labels, configured with standard ImageNet transforms
+    """
+    # Prefer an explicitly supplied cache dir, else check common local path
+    if local_cache_dir is None:
+        local_cache_dir = os.environ.get("HF_DATASETS_CACHE") or os.environ.get("HF_DATASETS_CACHE")
+        if not local_cache_dir:
+            candidate = os.path.join(os.getcwd(), "zh-plus___tiny-imagenet", "default", "0.0.0")
+            if os.path.exists(candidate):
+                local_cache_dir = candidate
+
+    # Load dataset using local cache when available to avoid downloading
+    if local_cache_dir and os.path.exists(local_cache_dir):
+        dataset = load_dataset("zh-plus/tiny-imagenet", split=split, cache_dir=local_cache_dir)
+    else:
+        dataset = load_dataset("zh-plus/tiny-imagenet", split=split)
+    
+    # Define image transformations
+    # For training: data augmentation; for validation: normalization only
+    if split == "train":
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),  # VGG16 expects 224x224 input
+            transforms.RandomCrop(224, padding=8),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
+        ])
+    else:
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),  # VGG16 expects 224x224 input
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
+        ])
+    
+    # Create a wrapper to apply transforms on-the-fly
+    class TinyImageNetWrapper(torch.utils.data.Dataset):
+        def __init__(self, hf_dataset, transform=None):
+            self.dataset = hf_dataset
+            self.transform = transform
+            
+        def __len__(self):
+            return len(self.dataset)
+            
+        def __getitem__(self, idx):
+            item = self.dataset[idx]
+            image = item["image"]
+            label = item["label"]
+            
+            if self.transform:
+                image = self.transform(image)
+                
+            return image, label
+    
+    return TinyImageNetWrapper(dataset, transform=transform)
 
 def train_vgg16_distributed():
     """
@@ -104,17 +179,32 @@ def train_vgg16_distributed():
 
     # Construct distributed dataloader
     # ax.create_dataloader handles data sharding across data-parallel ranks
-    train_dataset = torchvision.datasets.FakeData(
-        size=64 * 12 * 12, # 9216 samples / 512 global batch = 18 iterations per epoch
-        image_size=(3, 224, 224),
-        num_classes=1000,
-        transform=ToTensor(),
-    )
+    if rank == 0:
+        print("Loading Tiny ImageNet training dataset...")
+
+    # Prefer a local HF datasets cache when present. The code checks the
+    # `HF_DATASETS_CACHE` environment variable and then a repo-local candidate
+    # path (`./zh-plus___tiny-imagenet/default/0.0.0`). If neither exists the
+    # loader will fall back to the HF Hub.
+    local_cache = os.environ.get("HF_DATASETS_CACHE") or os.environ.get("HF_DATASETS_CACHE")
+    if not local_cache:
+        candidate = os.path.join(os.getcwd(), "zh-plus___tiny-imagenet", "default", "0.0.0")
+        if os.path.exists(candidate):
+            local_cache = candidate
+
+    if rank == 0:
+        if local_cache and os.path.exists(local_cache):
+            print(f"Using local Tiny ImageNet cache at {local_cache}")
+        else:
+            print("No local Tiny ImageNet cache detected; will download from HF Hub if needed")
+
+    train_dataset = load_tiny_imagenet_dataset(split="train", local_cache_dir=local_cache)
+    
     train_dataloader = ax.create_dataloader(
         dataset=train_dataset,
         global_batch_size=global_batch_size,
         micro_batch_size=batch_size_per_gpu,
-        num_workers=0,
+        num_workers=4,
     )
 
     # Training loop
@@ -136,7 +226,7 @@ def train_vgg16_distributed():
             loss = loss_fn(logits, y)
             # Backward pass (gradient synchronization occurs automatically via NCCL)
             loss.backward()
-            
+
             apply_topk_sparsification(model)
 
             # Gradient clipping to help with stability
