@@ -26,6 +26,36 @@ from axonn import axonn as ax
 
 from torch.optim.lr_scheduler import LinearLR, SequentialLR, CosineAnnealingLR
 
+@torch.no_grad()
+def apply_topk_sparsification(model, ratio=0.05):
+    """
+    Sparsifies gradients by keeping only the top-k magnitude values
+    and zeroing out the rest.
+    """
+    for p in model.parameters():
+        if p.grad is None:
+            continue
+            
+        # Flatten the gradient to 1D
+        grad_flat = p.grad.view(-1)
+        total_elements = grad_flat.numel()
+        
+        # Calculate k (e.g., 5% of total elements)
+        k = max(1, int(total_elements * ratio))
+        
+        # Get values and indices of Top-K magnitudes
+        # We use .abs() because a large negative gradient is just as important as a positive one
+        _, indices = torch.topk(grad_flat.abs(), k)
+        
+        # Create a dense mask or zero-filled tensor
+        # Then scatter the original values back into the top-k positions
+        topk_values = grad_flat[indices]
+        new_grad = torch.zeros_like(grad_flat)
+        new_grad.scatter_(0, indices, topk_values)
+        
+        # Replace the original gradient with the sparsified dense version
+        p.grad.copy_(new_grad.view(p.grad.shape))
+
 def train_vgg16_distributed():
     """
     Distributed training routine for VGG16 on synthetic ImageNet data.
@@ -106,7 +136,12 @@ def train_vgg16_distributed():
             loss = loss_fn(logits, y)
             # Backward pass (gradient synchronization occurs automatically via NCCL)
             loss.backward()
+            
+            apply_topk_sparsification(model)
 
+            # Gradient clipping to help with stability
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             # Parameter update
             optimizer.step()
 
