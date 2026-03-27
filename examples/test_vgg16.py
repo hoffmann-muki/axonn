@@ -37,7 +37,7 @@ def train_vgg16_distributed():
     batch_size_per_gpu = 64
     num_gpus = int(os.environ["WORLD_SIZE"])
     global_batch_size = num_gpus * batch_size_per_gpu
-    num_epochs = 2
+    num_epochs = 10
     learning_rate = 1e-3
 
     # Initialize torch.distributed process group (required before AxoNN initialization)
@@ -81,12 +81,13 @@ def train_vgg16_distributed():
     for epoch in range(num_epochs):
         epoch_loss = 0.0
         epoch_start = time.time()
+        batch_losses = []
 
-        for (x, y) in tqdm(
+        for batch_idx, (x, y) in enumerate(tqdm(
             train_dataloader,
             disable=(rank != 0),
             desc=f"Epoch {epoch + 1}/{num_epochs}",
-        ):
+        )):
             # Move data to GPU
             x, y = x.cuda(), y.cuda()
 
@@ -101,7 +102,13 @@ def train_vgg16_distributed():
             # Parameter update
             optimizer.step()
 
-            epoch_loss += loss.item()
+            batch_loss = loss.item()
+            batch_losses.append(batch_loss)
+            epoch_loss += batch_loss
+
+            # Log per-batch loss for rank 0
+            if rank == 0:
+                print(f"  Batch {batch_idx + 1}: loss = {batch_loss:.6f}")
 
         # Rank 0 reports epoch statistics
         if rank == 0:
@@ -115,6 +122,9 @@ def train_vgg16_distributed():
 
     if rank == 0:
         print("Training procedure completed.")
+
+    # Clean up distributed process group
+    dist.destroy_process_group()
 
 
 
