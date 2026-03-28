@@ -173,6 +173,8 @@ def train_vgg16_distributed(topk_ratio=0.0,
     for epoch in range(num_epochs):
         epoch_loss = 0.0
         epoch_start = time.time()
+        train_correct = 0
+        train_total = 0
 
         for batch_idx, (x, y) in enumerate(tqdm(train_dataloader, disable=(rank != 0), desc=f"Epoch {epoch+1}/{num_epochs}")):
             x, y = x.cuda(), y.cuda()
@@ -181,6 +183,14 @@ def train_vgg16_distributed(topk_ratio=0.0,
             logits = model(x)
             loss = loss_fn(logits, y)
             loss.backward()
+
+            # compute gradient norm
+            total_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** 0.5
 
             if topk_ratio is not None and 0.0 < topk_ratio < 1.0:
                 apply_topk_sparsification(model, topk_ratio=topk_ratio)
@@ -192,13 +202,52 @@ def train_vgg16_distributed(topk_ratio=0.0,
             batch_loss = float(loss.item())
             epoch_loss += batch_loss
 
-            if rank == 0 and batch_idx % 10 == 0:
+            # training accuracy accumulation
+            preds = logits.argmax(dim=1)
+            train_correct += int((preds == y).sum().item())
+            train_total += x.size(0)
+
+            # print per-batch info including grad norm (rank 0 only)
+            if rank == 0:
                 current_lr = optimizer.param_groups[0]['lr']
-                print(f"  Batch {batch_idx+1}: loss = {batch_loss:.6f} | LR = {current_lr:.6e}")
+                print(f"  Batch {batch_idx+1}: loss = {batch_loss:.6f} | LR = {current_lr:.6e} | grad_norm = {total_norm:.6f}")
 
         if rank == 0:
             avg_loss = epoch_loss / max(1, len(train_dataloader))
-            print(f"Epoch {epoch+1}: Average loss = {avg_loss:.4f}, Duration = {time.time()-epoch_start:.2f}s")
+            train_acc = 100.0 * train_correct / max(1, train_total)
+            print(f"Epoch {epoch+1}: Average loss = {avg_loss:.4f}, Train Acc = {train_acc:.2f}%, Duration = {time.time()-epoch_start:.2f}s")
+
+        # Validation (optional): try to load 'val' split and evaluate
+        try:
+            val_transform = transforms.Compose([
+                transforms.Lambda(lambda img: img.convert("RGB") if hasattr(img, "convert") else img),
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+            val_ds = load_caltech256_dataset(dataset_root, split="val", transform=val_transform)
+            val_loader = DataLoader(val_ds, batch_size=global_batch_size // max(1, num_gpus), shuffle=False, num_workers=num_workers or 0)
+
+            model.eval()
+            val_correct = 0
+            val_total = 0
+            with torch.no_grad():
+                for vx, vy in val_loader:
+                    vx, vy = vx.cuda(), vy.cuda()
+                    v_logits = model(vx)
+                    v_preds = v_logits.argmax(dim=1)
+                    val_correct += int((v_preds == vy).sum().item())
+                    val_total += vx.size(0)
+
+            val_acc = 100.0 * val_correct / max(1, val_total)
+            if rank == 0:
+                print(f"Validation Acc = {val_acc:.2f}% ({val_correct}/{val_total})")
+            model.train()
+        except Exception:
+            # skip validation if loader doesn't support 'val' or data not present
+            if rank == 0:
+                print("Validation skipped (no 'val' split or loader error)")
 
     dist.destroy_process_group()
 
