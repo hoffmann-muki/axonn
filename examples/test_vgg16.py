@@ -3,13 +3,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-"""Distributed training example using AxoNN's data parallelism with VGG16 on Open Images.
-
-This example demonstrates how to:
-    - Initialize AxoNN with data parallelism across multiple GPUs
-    - Construct a distributed dataloader that shards data across ranks
-    - Implement a distributed training loop with gradient synchronization via NCCL
-    - Load Open Images (prefer torchvision.OpenImages; falls back to ImageFolder)
+"""Distributed training example: VGG16 on Places365 using AxoNN.
 """
 
 import os
@@ -25,6 +19,7 @@ from torchvision import transforms
 from torchvision.models import VGG16_Weights
 from tqdm import tqdm
 from torch.optim.lr_scheduler import LinearLR, SequentialLR, CosineAnnealingLR
+from torch.utils.data import DataLoader
 
 from axonn import axonn as ax
 
@@ -53,52 +48,28 @@ def apply_topk_sparsification(model, topk_ratio=0.05):
         p.grad.copy_(new_grad.view(p.grad.shape))
 
 
-def load_open_images_dataset(root, split="train", transform=None):
+def load_places365_dataset(root, split="train", transform=None):
+    """Return a torchvision ImageFolder for the given Places365 root/split.
+
+    Assumes the user provides a correct ImageFolder layout: <root>/<split>/<class>/*.jpg
     """
-    Load Open Images dataset.
-
-    This prefers `torchvision.datasets.OpenImages` when available. If the
-    user has exported Open Images into a class-organized ImageFolder layout
-    (root/<split>/<class>/*.jpg) this function will load via `ImageFolder`.
-
-    Arguments:
-        root (str): dataset root directory or parent folder containing split subdirs
-        split (str): 'train' or 'validation' (or dataset-specific)
-        transform: torchvision transforms to apply
-
-    Returns:
-        A torch Dataset instance.
-    """
-    # prefer torchvision.OpenImages if available and user points to original layout
-    OpenImages = getattr(datasets, "OpenImages", None)
-
-    if OpenImages is not None and os.path.isdir(root) and any(name.lower().startswith("openimages") for name in os.listdir(root)):
-        # best-effort: user has the raw OpenImages checkout under `root`
-        return OpenImages(root=root, split=split, transform=transform)
-
-    # fallback: expect ImageFolder layout at root/<split>/class_name/*.jpg
     split_path = os.path.join(root, split)
-    if os.path.isdir(split_path):
-        return datasets.ImageFolder(split_path, transform=transform)
-
-    raise RuntimeError(
-        f"OpenImages not found at {root} and no ImageFolder at {split_path}. "
-        "Prepare data as OpenImages or organize images under <root>/<split>/<class>/..."
-    )
+    return datasets.ImageFolder(split_path, transform=transform)
 
 def train_vgg16_distributed(topk_ratio=0.0,
                             batch_size_per_gpu=32,
                             num_epochs=30,
                             base_lr=None,
                             pretrained=False,
-                            dataset_root="./open_images",
-                            num_classes=600,
+                            dataset_root=None,
+                            split="train",
+                            num_classes=365,
                             num_workers=None):
     """
-    Distributed training routine for VGG16 on Open Images using AxoNN.
+    Distributed training routine for VGG16 on Places365 using AxoNN.
 
-    Expects `dataset_root` to contain the dataset, either in OpenImages
-    layout (if torchvision.OpenImages is available) or as
+    Expects `dataset_root` to contain the dataset, either in Places365
+    layout (if torchvision.Places365 is available) or as
     `dataset_root/<split>/<class_name>/*.jpg` for ImageFolder.
     """
     # Configuration
@@ -133,7 +104,7 @@ def train_vgg16_distributed(topk_ratio=0.0,
     loss_fn = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=5e-4)
 
-    # Build transforms for VGG (224x224 ImageNet-style)
+    # VGG input transforms (224x224, ImageNet normalization)
     train_transform = transforms.Compose([
         # Ensure images are RGB to avoid grayscale corruption from some datasets
         transforms.Lambda(lambda img: img.convert("RGB") if hasattr(img, "convert") else img),
@@ -144,20 +115,11 @@ def train_vgg16_distributed(topk_ratio=0.0,
     ])
 
     # Only rank 0 may perform dataset setup/download
-    if rank == 0:
-        print("Preparing Open Images dataset (rank 0)...")
-        # attempt a dry-run load to trigger any checks/downloads if needed
-        try:
-            _ = load_open_images_dataset(dataset_root, split="train", transform=train_transform)
-        except Exception as e:
-            print(f"Dataset preparation error on rank 0: {e}")
-            raise
-
     # synchronize so all ranks wait for rank 0
     dist.barrier()
 
-    # load dataset on all ranks
-    train_dataset = load_open_images_dataset(dataset_root, split="train", transform=train_transform)
+    # load dataset on all ranks (assume correct layout)
+    train_dataset = load_places365_dataset(dataset_root, split=split, transform=train_transform)
 
     train_dataloader = ax.create_dataloader(
         dataset=train_dataset,
@@ -210,21 +172,22 @@ def train_vgg16_distributed(topk_ratio=0.0,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train VGG16 on Open Images with AxoNN")
+    parser = argparse.ArgumentParser(description="Train VGG16 on Places365 with AxoNN")
     parser.add_argument("--topk", type=float, default=0.0, help="Fraction of gradients to keep via top-k sparsification (0 disables)")
     parser.add_argument("--batch-size-per-gpu", type=int, default=32, help="Per-GPU micro-batch size")
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=None, help="Base learning rate (linear scaling if omitted)")
     parser.add_argument("--pretrained", action="store_true", help="Use ImageNet-pretrained VGG16 weights")
-    parser.add_argument("--dataset-root", type=str, default="./open_images", help="Path to OpenImages root or ImageFolder layout")
-    parser.add_argument("--num-classes", type=int, default=600, help="Number of target classes")
+    parser.add_argument("--dataset-root", type=str, required=True, help="Path to Places365 root or ImageFolder layout")
+    parser.add_argument("--split", type=str, default="train", help="Dataset split name (train or val)")
+    parser.add_argument("--num-classes", type=int, default=365, help="Number of target classes")
     parser.add_argument("--num-workers", type=int, default=None, help="Number of DataLoader workers per process")
     parser.add_argument("--dry-run", action="store_true", help="Perform a CPU-only dry-run: validate dataset and model instantiation without distributed init or GPUs")
 
     args = parser.parse_args()
     if args.dry_run:
-        # Validate dataset loading and model instantiation on CPU without distributed init
-        print("Running dry-run: validating dataset and model on CPU")
+        # Dry-run: validate dataset and model on CPU
+        print("Dry-run: validating dataset and model on CPU")
         tr = transforms.Compose([
             transforms.Lambda(lambda img: img.convert("RGB") if hasattr(img, "convert") else img),
             transforms.Resize(256),
@@ -232,9 +195,7 @@ def main():
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
-        ds = load_open_images_dataset(args.dataset_root, split="train", transform=tr)
-        from torch.utils.data import DataLoader
-
+        ds = load_places365_dataset(args.dataset_root, split=args.split, transform=tr)
         loader = DataLoader(ds, batch_size=4, shuffle=False, num_workers=(args.num_workers or 0))
         # instantiate model on CPU
         weights = VGG16_Weights.IMAGENET1K_V1 if args.pretrained else None
@@ -255,6 +216,7 @@ def main():
             base_lr=args.lr,
             pretrained=args.pretrained,
             dataset_root=args.dataset_root,
+            split=args.split,
             num_classes=args.num_classes,
             num_workers=args.num_workers,
         )
