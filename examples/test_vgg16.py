@@ -83,7 +83,8 @@ def train_vgg16_distributed(topk_ratio=0.0,
                             dataset_root=None,
                             split="train",
                             num_classes=256,
-                            num_workers=None):
+                            num_workers=None,
+                            optimizer_name="adamw"):
     """
     Distributed training routine for VGG16 on Caltech-256 using AxoNN.
 
@@ -95,7 +96,11 @@ def train_vgg16_distributed(topk_ratio=0.0,
     global_batch_size = num_gpus * batch_size_per_gpu
 
     if base_lr is None:
-        base_lr = 0.1 * (global_batch_size / 256)
+        # default LR depends on optimizer choice: SGD uses 0.1 scale, AdamW uses 1e-3 scale
+        if optimizer_name.lower() == 'sgd':
+            base_lr = 0.1 * (global_batch_size / 256)
+        else:
+            base_lr = 1e-3 * (global_batch_size / 256)
 
     if num_workers is None:
         num_workers = min(8, (os.cpu_count() or 4))
@@ -136,7 +141,10 @@ def train_vgg16_distributed(topk_ratio=0.0,
     model.classifier[6] = torch.nn.Linear(model.classifier[6].in_features, num_classes).cuda()
 
     loss_fn = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=5e-4)
+    if optimizer_name.lower() == 'sgd':
+        optimizer = torch.optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=5e-4)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=5e-4)
 
     # VGG input transforms (224x224, ImageNet normalization)
     train_transform = transforms.Compose([
@@ -263,6 +271,7 @@ def main():
     parser.add_argument("--split", type=str, default="train", help="Dataset split name (train or val)")
     parser.add_argument("--num-classes", type=int, default=256, help="Number of target classes")
     parser.add_argument("--num-workers", type=int, default=None, help="Number of DataLoader workers per process")
+    parser.add_argument("--optimizer", type=str, default="adamw", choices=["sgd","adamw"], help="Optimizer to use (sgd or adamw)")
     parser.add_argument("--download", action="store_true", help="Download Caltech-256 into --dataset-root (rank 0 only)")
     parser.add_argument("--dry-run", action="store_true", help="Perform a CPU-only dry-run: validate dataset and model instantiation without distributed init or GPUs")
 
@@ -305,6 +314,7 @@ def main():
             split=args.split,
             num_classes=args.num_classes,
             num_workers=args.num_workers,
+            optimizer_name=args.optimizer,
         )
 
 
