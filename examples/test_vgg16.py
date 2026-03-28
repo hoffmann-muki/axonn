@@ -17,6 +17,7 @@ import time
 
 import torch
 import torch.distributed as dist
+import argparse
 import torchvision.models as models
 from torchvision import transforms
 from tqdm import tqdm
@@ -27,33 +28,27 @@ from axonn import axonn as ax
 from torch.optim.lr_scheduler import LinearLR, SequentialLR, CosineAnnealingLR
 
 @torch.no_grad()
-def apply_topk_sparsification(model, ratio=0.05):
+def apply_topk_sparsification(model, topk_ratio=0.05):
     """
-    Sparsifies gradients by keeping only the top-k magnitude values
-    and zeroing out the rest.
+    Sparsifies gradients by keeping only the top-k magnitude values and
+    zeroing out the rest. `topk_ratio` is the fraction of elements to keep
+    (e.g. 0.05 keeps the top 5% of gradient magnitudes).
     """
     for p in model.parameters():
         if p.grad is None:
             continue
-            
-        # Flatten the gradient to 1D
+
         grad_flat = p.grad.view(-1)
         total_elements = grad_flat.numel()
-        
-        # Calculate k (e.g., 5% of total elements)
-        k = max(1, int(total_elements * ratio))
-        
-        # Get values and indices of Top-K magnitudes
-        # We use .abs() because a large negative gradient is just as important as a positive one
+
+        k = max(1, int(total_elements * topk_ratio))
+
         _, indices = torch.topk(grad_flat.abs(), k)
-        
-        # Create a dense mask or zero-filled tensor
-        # Then scatter the original values back into the top-k positions
+
         topk_values = grad_flat[indices]
         new_grad = torch.zeros_like(grad_flat)
         new_grad.scatter_(0, indices, topk_values)
-        
-        # Replace the original gradient with the sparsified dense version
+
         p.grad.copy_(new_grad.view(p.grad.shape))
 
 
@@ -88,26 +83,21 @@ def load_tiny_imagenet_dataset(split="train", local_cache_dir=None):
         dataset = load_dataset("zh-plus/tiny-imagenet", split=split)
     
     # Define image transformations
-    # For training: data augmentation; for validation: normalization only
+    # For training: use RandomResizedCrop + horizontal flip + normalization.
+    # For validation: resize and center-crop to 224 then normalize.
     if split == "train":
         transform = transforms.Compose([
-            transforms.Resize((224, 224)),  # VGG16 expects 224x224 input
-            transforms.RandomCrop(224, padding=8),
+            transforms.RandomResizedCrop(224),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
-            ),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
     else:
         transform = transforms.Compose([
-            transforms.Resize((224, 224)),  # VGG16 expects 224x224 input
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
             transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
-            ),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
     
     # Create a wrapper to apply transforms on-the-fly
@@ -136,20 +126,30 @@ def load_tiny_imagenet_dataset(split="train", local_cache_dir=None):
     
     return TinyImageNetWrapper(dataset, transform=transform)
 
-def train_vgg16_distributed():
+def train_vgg16_distributed(topk_ratio=0.0,
+                            batch_size_per_gpu=32,
+                            num_epochs=30,
+                            base_lr=None,
+                            pretrained=False,
+                            num_workers=None):
     """
-    Distributed training routine for VGG16 on synthetic ImageNet data.
+    Distributed training routine for VGG16 on Tiny ImageNet.
     
     Requires:
       - WORLD_SIZE environment variable set to the number of processes
       - Launch via torchrun or mpirun with proper rank environment variables
     """
-    # Configuration
-    batch_size_per_gpu = 64
-    num_gpus = int(os.environ["WORLD_SIZE"])
+    # Configuration (defaults chosen for stable training)
+    num_gpus = int(os.environ.get("WORLD_SIZE", "1"))
     global_batch_size = num_gpus * batch_size_per_gpu
-    num_epochs = 10
-    learning_rate = 1e-3
+
+    # Learning rate: if not supplied, use linear-scaling heuristic for SGD
+    if base_lr is None:
+        base_lr = 0.1 * (global_batch_size / 256)
+
+    # Reasonable default for data loader workers
+    if num_workers is None:
+        num_workers = min(8, (os.cpu_count() or 4))
 
     # Initialize torch.distributed process group (required before AxoNN initialization)
     if not dist.is_initialized():
@@ -169,18 +169,20 @@ def train_vgg16_distributed():
         print(f"Global batch size: {global_batch_size}")
 
     # Instantiate model and training components
-    model = models.vgg16().cuda()
-    loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, eps=1e-6)
+    model = models.vgg16(pretrained=pretrained).cuda()
 
-    # Learning rate scheduler with warmup
-    # We ramp up for 1 epoch then decay
-    warmup_steps = 18 
-    total_steps = 18 * num_epochs
-    
-    scheduler1 = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
-    scheduler2 = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
-    scheduler = SequentialLR(optimizer, schedulers=[scheduler1, scheduler2], milestones=[warmup_steps])
+    # Use standard cross-entropy for initial experiments
+    loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=0.0)
+
+    # SGD with momentum and weight decay is a robust baseline for image
+    # classification when training from scratch; scale lr with batch size.
+    optimizer = torch.optim.SGD(
+        model.parameters(), lr=base_lr, momentum=0.9, weight_decay=5e-4
+    )
+
+    # NOTE: scheduler will be created after the dataloader is constructed
+    # so that we can compute warmup/total steps from the number of batches.
+    scheduler = None
 
     # Construct distributed dataloader
     # ax.create_dataloader handles data sharding across data-parallel ranks
@@ -209,8 +211,18 @@ def train_vgg16_distributed():
         dataset=train_dataset,
         global_batch_size=global_batch_size,
         micro_batch_size=batch_size_per_gpu,
-        num_workers=4,
+        num_workers=num_workers,
     )
+
+    # Build scheduler based on steps per epoch (batches per epoch)
+    steps_per_epoch = len(train_dataloader)
+    total_steps = steps_per_epoch * num_epochs
+    # Warmup for a small fraction of the first epoch (10% of an epoch)
+    warmup_steps = max(1, steps_per_epoch // 10)
+
+    scheduler1 = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
+    scheduler2 = CosineAnnealingLR(optimizer, T_max=max(1, total_steps - warmup_steps))
+    scheduler = SequentialLR(optimizer, schedulers=[scheduler1, scheduler2], milestones=[warmup_steps])
 
     # Training loop
     for epoch in range(num_epochs):
@@ -232,10 +244,12 @@ def train_vgg16_distributed():
             # Backward pass (gradient synchronization occurs automatically via NCCL)
             loss.backward()
 
-            apply_topk_sparsification(model)
+            # Apply gradient sparsification (keep fraction `topk_ratio`)
+            if topk_ratio is not None and topk_ratio > 0.0 and topk_ratio < 1.0:
+                apply_topk_sparsification(model, topk_ratio=topk_ratio)
 
             # Gradient clipping to help with stability
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             
             # Parameter update
             optimizer.step()
@@ -261,4 +275,22 @@ def train_vgg16_distributed():
 
 
 if __name__ == "__main__":
-    train_vgg16_distributed()
+    parser = argparse.ArgumentParser(description="Distributed VGG16 training example")
+    parser.add_argument("--topk", type=float, default=0.0,
+                        help="Fraction of gradient elements to keep for top-k sparsification (e.g. 0.05). Set to 0 to disable.")
+    parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
+    parser.add_argument("--batch-size-per-gpu", type=int, default=32, help="Per-GPU micro-batch size")
+    parser.add_argument("--lr", type=float, default=None, help="Base learning rate; if unset, use linear scaling heuristic")
+    parser.add_argument("--pretrained", action="store_true", help="Use ImageNet pretrained weights for VGG16 (fine-tuning)")
+    parser.add_argument("--num-workers", type=int, default=None, help="Number of dataloader worker processes per rank")
+
+    args = parser.parse_args()
+
+    train_vgg16_distributed(
+        topk_ratio=args.topk,
+        batch_size_per_gpu=args.batch_size_per_gpu,
+        num_epochs=args.epochs,
+        base_lr=args.lr,
+        pretrained=args.pretrained,
+        num_workers=args.num_workers,
+    )
