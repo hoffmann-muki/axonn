@@ -120,7 +120,8 @@ def train_vgg16_distributed(topk_ratio=0.0,
                             split="train",
                             num_classes=256,
                             num_workers=None,
-                            optimizer_name="adamw"):
+                            optimizer_name="adamw",
+                            log_grad_sizes: bool = False):
     """
     Distributed training routine for VGG16 on Caltech-256 using AxoNN.
 
@@ -228,12 +229,13 @@ def train_vgg16_distributed(topk_ratio=0.0,
             loss = loss_fn(logits, y)
             loss.backward()
 
-            # log approximate gradient all-reduce message sizes (rank 0 only)
-            try:
-                log_grad_message_sizes(model, top_n=8)
-            except Exception:
-                # don't fail training if logging has issues
-                pass
+            # optionally log approximate gradient all-reduce message sizes (aggregated, rank 0)
+            if log_grad_sizes:
+                try:
+                    log_grad_message_sizes(model, top_n=8)
+                except Exception:
+                    # don't fail training if logging has issues
+                    pass
 
             # compute gradient norm
             total_norm = 0.0
@@ -316,6 +318,7 @@ def main():
     parser.add_argument("--num-workers", type=int, default=None, help="Number of DataLoader workers per process")
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["sgd","adamw"], help="Optimizer to use (sgd or adamw)")
     parser.add_argument("--download", action="store_true", help="Download Caltech-256 into --dataset-root (rank 0 only)")
+    parser.add_argument("--log-grad-sizes", action="store_true", help="Enable aggregated gradient-message-size logging (global total printed on rank 0)")
     parser.add_argument("--dry-run", action="store_true", help="Perform a CPU-only dry-run: validate dataset and model instantiation without distributed init or GPUs")
 
     args = parser.parse_args()
@@ -358,6 +361,7 @@ def main():
             num_classes=args.num_classes,
             num_workers=args.num_workers,
             optimizer_name=args.optimizer,
+            log_grad_sizes=args.log_grad_sizes,
         )
 
 
