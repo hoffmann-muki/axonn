@@ -3,8 +3,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-"""
-Distributed training example using AxoNN's data parallelism with VGG16.
+"""Distributed training example using AxoNN's data parallelism with ResNet-18 on CIFAR-10.
 
 This example demonstrates how to:
   - Initialize AxoNN with data parallelism across multiple GPUs
@@ -19,9 +18,9 @@ import torch
 import torch.distributed as dist
 import argparse
 import torchvision.models as models
+import torchvision.datasets as datasets
 from torchvision import transforms
 from tqdm import tqdm
-from datasets import load_dataset
 
 from axonn import axonn as ax
 
@@ -52,88 +51,43 @@ def apply_topk_sparsification(model, topk_ratio=0.05):
         p.grad.copy_(new_grad.view(p.grad.shape))
 
 
-def load_tiny_imagenet_dataset(split="train", local_cache_dir=None):
+def load_cifar10_dataset(split="train"):
     """
-    Load Tiny ImageNet dataset using Hugging Face `datasets`.
-
-    This function will prefer a local cache directory when provided or when
-    a conventional local cache path exists inside the repository
-    (`./zh-plus___tiny-imagenet/default/0.0.0`). If no local cache is found
-    it falls back to loading from the Hugging Face Hub.
+    Load CIFAR-10 dataset using torchvision.datasets.
 
     Arguments:
-        split (str): 'train' for training set, 'valid' for validation set
-        local_cache_dir (str|None): Optional path to a local HF datasets cache
+        split (str): 'train' for training set, 'test' for test set
 
     Returns:
-        Dataset with images and labels, configured with standard ImageNet transforms
+        CIFAR-10 dataset with standard transforms
     """
-    # Prefer an explicitly supplied cache dir, else check common local path
-    if local_cache_dir is None:
-        local_cache_dir = os.environ.get("HF_DATASETS_CACHE") or os.environ.get("HF_DATASETS_CACHE")
-        if not local_cache_dir:
-            candidate = os.path.join(os.getcwd(), "zh-plus___tiny-imagenet", "default", "0.0.0")
-            if os.path.exists(candidate):
-                local_cache_dir = candidate
-
-    # Load dataset using local cache when available to avoid downloading
-    if local_cache_dir and os.path.exists(local_cache_dir):
-        dataset = load_dataset("zh-plus/tiny-imagenet", split=split, cache_dir=local_cache_dir)
-    else:
-        dataset = load_dataset("zh-plus/tiny-imagenet", split=split)
-    
     # Define image transformations
-    # For training: use RandomResizedCrop + horizontal flip + normalization.
-    # For validation: resize and center-crop to 224 then normalize.
+    # For training: horizontal flip and random crops with padding; for test: no augmentation.
     if split == "train":
         transform = transforms.Compose([
-            transforms.RandomResizedCrop(224),
+            transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2470, 0.2435, 0.2616]),
         ])
     else:
         transform = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2470, 0.2435, 0.2616]),
         ])
-    
-    # Create a wrapper to apply transforms on-the-fly
-    class TinyImageNetWrapper(torch.utils.data.Dataset):
-        def __init__(self, hf_dataset, transform=None):
-            self.dataset = hf_dataset
-            self.transform = transform
-            
-        def __len__(self):
-            return len(self.dataset)
-            
-        def __getitem__(self, idx):
-            item = self.dataset[idx]
-            image = item["image"]
-            label = item["label"]
-            
-            # Convert to RGB to handle grayscale images
-            # (Tiny ImageNet contains both RGB and grayscale images)
-            if image.mode != "RGB":
-                image = image.convert("RGB")
-            
-            if self.transform:
-                image = self.transform(image)
-                
-            return image, label
-    
-    return TinyImageNetWrapper(dataset, transform=transform)
 
-def train_vgg16_distributed(topk_ratio=0.0,
-                            batch_size_per_gpu=32,
-                            num_epochs=30,
-                            base_lr=None,
-                            pretrained=False,
-                            num_workers=None):
+    # Use torchvision's built-in CIFAR-10 loader; downloads to './data' if not present
+    dataset = datasets.CIFAR10(root="./data", train=(split == "train"), transform=transform, download=True)
+    return dataset
+
+def train_resnet18_distributed(topk_ratio=0.0,
+                               batch_size_per_gpu=128,
+                               num_epochs=200,
+                               base_lr=None,
+                               pretrained=False,
+                               num_workers=None):
     """
-    Distributed training routine for VGG16 on Tiny ImageNet.
+    Distributed training routine for ResNet-18 on CIFAR-10.
     
     Requires:
       - WORLD_SIZE environment variable set to the number of processes
@@ -167,9 +121,13 @@ def train_vgg16_distributed(topk_ratio=0.0,
     if rank == 0:
         print(f"Initialized distributed training on {world_size} GPUs")
         print(f"Global batch size: {global_batch_size}")
+        print(f"Base LR: {base_lr:.6f}")
 
     # Instantiate model and training components
-    model = models.vgg16(pretrained=pretrained).cuda()
+    # ResNet-18 is a good baseline for CIFAR-10 (32x32 images, 10 classes)
+    model = models.resnet18(pretrained=pretrained).cuda()
+    # Adapt the final layer for CIFAR-10 (10 classes instead of ImageNet 1000)
+    model.fc = torch.nn.Linear(model.fc.in_features, 10).cuda()
 
     # Use standard cross-entropy for initial experiments
     loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=0.0)
@@ -187,25 +145,9 @@ def train_vgg16_distributed(topk_ratio=0.0,
     # Construct distributed dataloader
     # ax.create_dataloader handles data sharding across data-parallel ranks
     if rank == 0:
-        print("Loading Tiny ImageNet training dataset...")
+        print("Loading CIFAR-10 training dataset...")
 
-    # Prefer a local HF datasets cache when present. The code checks the
-    # `HF_DATASETS_CACHE` environment variable and then a repo-local candidate
-    # path (`./zh-plus___tiny-imagenet/default/0.0.0`). If neither exists the
-    # loader will fall back to the HF Hub.
-    local_cache = os.environ.get("HF_DATASETS_CACHE") or os.environ.get("HF_DATASETS_CACHE")
-    if not local_cache:
-        candidate = os.path.join(os.getcwd(), "zh-plus___tiny-imagenet", "default", "0.0.0")
-        if os.path.exists(candidate):
-            local_cache = candidate
-
-    if rank == 0:
-        if local_cache and os.path.exists(local_cache):
-            print(f"Using local Tiny ImageNet cache at {local_cache}")
-        else:
-            print("No local Tiny ImageNet cache detected; will download from HF Hub if needed")
-
-    train_dataset = load_tiny_imagenet_dataset(split="train", local_cache_dir=local_cache)
+    train_dataset = load_cifar10_dataset(split="train")
     
     train_dataloader = ax.create_dataloader(
         dataset=train_dataset,
@@ -275,18 +217,18 @@ def train_vgg16_distributed(topk_ratio=0.0,
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Distributed VGG16 training example")
+    parser = argparse.ArgumentParser(description="Distributed ResNet-18 training on CIFAR-10")
     parser.add_argument("--topk", type=float, default=0.0,
                         help="Fraction of gradient elements to keep for top-k sparsification (e.g. 0.05). Set to 0 to disable.")
-    parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
-    parser.add_argument("--batch-size-per-gpu", type=int, default=32, help="Per-GPU micro-batch size")
+    parser.add_argument("--epochs", type=int, default=200, help="Number of training epochs")
+    parser.add_argument("--batch-size-per-gpu", type=int, default=128, help="Per-GPU micro-batch size")
     parser.add_argument("--lr", type=float, default=None, help="Base learning rate; if unset, use linear scaling heuristic")
-    parser.add_argument("--pretrained", action="store_true", help="Use ImageNet pretrained weights for VGG16 (fine-tuning)")
+    parser.add_argument("--pretrained", action="store_true", help="Use ImageNet pretrained weights for ResNet-18 (fine-tuning)")
     parser.add_argument("--num-workers", type=int, default=None, help="Number of dataloader worker processes per rank")
 
     args = parser.parse_args()
 
-    train_vgg16_distributed(
+    train_resnet18_distributed(
         topk_ratio=args.topk,
         batch_size_per_gpu=args.batch_size_per_gpu,
         num_epochs=args.epochs,
