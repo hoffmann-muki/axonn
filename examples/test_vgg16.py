@@ -18,6 +18,7 @@ import torch
 import torch.distributed as dist
 import argparse
 import torchvision.models as models
+from torchvision.models import ResNet18_Weights
 import torchvision.datasets as datasets
 from torchvision import transforms
 from tqdm import tqdm
@@ -125,7 +126,9 @@ def train_resnet18_distributed(topk_ratio=0.0,
 
     # Instantiate model and training components
     # ResNet-18 is a good baseline for CIFAR-10 (32x32 images, 10 classes)
-    model = models.resnet18(pretrained=pretrained).cuda()
+    # Use weights parameter instead of deprecated 'pretrained' (torchvision 0.13+)
+    weights = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+    model = models.resnet18(weights=weights).cuda()
     # Adapt the final layer for CIFAR-10 (10 classes instead of ImageNet 1000)
     model.fc = torch.nn.Linear(model.fc.in_features, 10).cuda()
 
@@ -146,6 +149,11 @@ def train_resnet18_distributed(topk_ratio=0.0,
     # ax.create_dataloader handles data sharding across data-parallel ranks
     if rank == 0:
         print("Loading CIFAR-10 training dataset...")
+        # Only rank 0 downloads to avoid concurrent download corruption
+        load_cifar10_dataset(split="train")
+
+    # Synchronize all ranks before proceeding (rank 0 finishes download first)
+    dist.barrier()
 
     train_dataset = load_cifar10_dataset(split="train")
     
@@ -223,7 +231,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=200, help="Number of training epochs")
     parser.add_argument("--batch-size-per-gpu", type=int, default=128, help="Per-GPU micro-batch size")
     parser.add_argument("--lr", type=float, default=None, help="Base learning rate; if unset, use linear scaling heuristic")
-    parser.add_argument("--pretrained", action="store_true", help="Use ImageNet pretrained weights for ResNet-18 (fine-tuning)")
+    parser.add_argument("--pretrained", action="store_true", help="Use ImageNet pretrained weights for ResNet-18 fine-tuning")
     parser.add_argument("--num-workers", type=int, default=None, help="Number of dataloader worker processes per rank")
 
     args = parser.parse_args()
