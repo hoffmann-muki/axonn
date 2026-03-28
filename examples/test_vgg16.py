@@ -204,6 +204,8 @@ def main():
     args = parser.parse_args()
     if args.download:
         ensure_caltech256_download(args.dataset_root)
+        print("Caltech-256 download complete (--download); exiting.")
+        return
     if args.dry_run:
         # Dry-run: validate dataset and model on CPU
         print("Dry-run: validating dataset and model on CPU")
