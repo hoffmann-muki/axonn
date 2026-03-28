@@ -4,6 +4,17 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 """Distributed training example: VGG16 on Caltech-256 using AxoNN.
+
+This script demonstrates a minimal distributed training loop that uses
+AxoNN to set up data-parallel process groups and to shard the input
+dataset across ranks.
+
+Notes:
+- Use ``--dataset-root`` to point to Caltech-256 or ``--download`` to
+    fetch the dataset on rank 0.
+- This example logs aggregated gradient-message sizes when enabled via
+    ``--log-grad-sizes``; the logging uses AxoNN's data-parallel group
+    and will be skipped if AxoNN is not initialized.
 """
 
 import os
@@ -24,11 +35,11 @@ from torch.utils.data import DataLoader
 from axonn import axonn as ax
 
 @torch.no_grad()
-def apply_topk_sparsification(model, topk_ratio=0.05):
-    """
-    Sparsifies gradients by keeping only the top-k magnitude values and
-    zeroing out the rest. `topk_ratio` is the fraction of elements to keep
-    (e.g. 0.05 keeps the top 5% of gradient magnitudes).
+def apply_topk_sparsification(model, topk_ratio: float = 0.05) -> None:
+    """Sparsify gradients in-place by keeping the largest magnitudes.
+
+    For each parameter, keep the largest ``topk_ratio`` fraction of
+    gradient elements (by absolute value) and zero the remainder.
     """
     for p in model.parameters():
         if p.grad is None:
@@ -48,40 +59,51 @@ def apply_topk_sparsification(model, topk_ratio=0.05):
         p.grad.copy_(new_grad.view(p.grad.shape))
 
 
-def log_grad_message_sizes(model, top_n=10):
-    """Log approximate all-reduce message sizes for parameter gradients (per-rank).
+def log_grad_message_sizes(model, top_n: int = 10) -> None:
+    """Compute and report per-data-parallel-rank gradient-message sizes.
 
-    Prints total bytes and top-N largest gradient tensors by size.
+    This computes the approximate number of bytes that would be communicated
+    during an all-reduce of gradients for ``model``. The function requires
+    AxoNN's data-parallel group (``ax.comm_handle.data_parallel_group``)
+    and will skip logging if AxoNN is not initialized.
     """
-    # compute local total bytes
-    per = []
-    total_bytes = 0
+    # Collect local per-parameter gradient sizes (bytes)
+    per_rank_info = []
+    local_total = 0
     for name, p in model.named_parameters():
         if p.grad is None:
             continue
-        nbytes = p.grad.numel() * p.grad.element_size()
-        total_bytes += int(nbytes)
-        per.append((name, p.grad.shape, int(nbytes)))
+        nbytes = int(p.grad.numel() * p.grad.element_size())
+        local_total += nbytes
+        per_rank_info.append((name, tuple(p.grad.shape), nbytes))
 
-    # aggregate across ranks (use a GPU tensor if model is on GPU and dist backend is NCCL)
-    if dist.is_initialized():
-        try:
-            device = next(model.parameters()).device
-            tensor_device = device if device.type == "cuda" else torch.device("cpu")
-        except StopIteration:
-            tensor_device = torch.device("cpu")
+    # Require AxoNN's data-parallel group; do not fall back to global world group
+    if not (dist.is_initialized() and hasattr(ax, "comm_handle") and getattr(ax.comm_handle, "data_parallel_group", None) is not None):
+        if dist.is_initialized() and dist.get_rank() == 0:
+            print("AxoNN data-parallel group unavailable; skipping grad-size logging")
+        return
 
-        local = torch.tensor([total_bytes], dtype=torch.long, device=tensor_device)
-        dist.all_reduce(local, op=dist.ReduceOp.SUM)
-        global_total = int(local.item())
-        rank = dist.get_rank()
-    else:
-        global_total = total_bytes
-        rank = 0
+    group = ax.comm_handle.data_parallel_group
+    group_size = ax.comm_handle.G_data
+    rank_in_group = ax.comm_handle.data_parallel_rank
 
-    # print only aggregated total on rank 0 to avoid log flooding
-    if rank == 0:
-        print(f"[rank {rank}] allreduce total bytes (global, approx): {global_total} ({global_total/1024**2:.3f} MB)")
+    # Build a 1-element tensor on the same device as model parameters for collectives
+    try:
+        device = next(model.parameters()).device
+        tensor_device = device if device.type == "cuda" else torch.device("cpu")
+    except StopIteration:
+        tensor_device = torch.device("cpu")
+
+    local = torch.tensor([local_total], dtype=torch.long, device=tensor_device)
+    gathered = [torch.zeros_like(local) for _ in range(group_size)]
+    dist.all_gather(gathered, local, group=group)
+    gathered_ints = [int(x.item()) for x in gathered]
+
+    # Print per-group-rank totals from the group's rank 0
+    if rank_in_group == 0:
+        print("[group-rank 0] per-group-rank allreduce bytes (approx):")
+        for i, val in enumerate(gathered_ints):
+            print(f"  rank {i}: {val} bytes ({val/1024**2:.3f} MB)")
 
 
 def load_caltech256_dataset(root, split="train", transform=None):
