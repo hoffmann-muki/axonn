@@ -67,27 +67,57 @@ def log_grad_message_sizes(model, top_n: int = 10) -> None:
     AxoNN's data-parallel group (``ax.comm_handle.data_parallel_group``)
     and will skip logging if AxoNN is not initialized.
     """
-    # Collect local per-parameter gradient sizes (bytes)
-    per_rank_info = []
-    local_total = 0
-    for name, p in model.named_parameters():
-        if p.grad is None:
-            continue
-        nbytes = int(p.grad.numel() * p.grad.element_size())
-        local_total += nbytes
-        per_rank_info.append((name, tuple(p.grad.shape), nbytes))
-
-    # Require AxoNN's data-parallel group; do not fall back to global world group
+    # Classify gradients the same way AxoNN's `sync_gradients` does, so
+    # we count only those gradients that will be reduced over the
+    # data-parallel group.
     if not (dist.is_initialized() and hasattr(ax, "comm_handle") and getattr(ax.comm_handle, "data_parallel_group", None) is not None):
         if dist.is_initialized() and dist.get_rank() == 0:
             print("AxoNN data-parallel group unavailable; skipping grad-size logging")
         return
 
-    group = ax.comm_handle.data_parallel_group
+    data_parallel_group = ax.comm_handle.data_parallel_group
     group_size = ax.comm_handle.G_data
     rank_in_group = ax.comm_handle.data_parallel_rank
 
-    # Build a 1-element tensor on the same device as model parameters for collectives
+    tensor_parallel_weights = []
+    tensor_parallel_biases = []
+    others = []
+
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        grad = getattr(p, "grad", None)
+        if grad is None:
+            continue
+
+        # Behavior mirrors `sync_gradients` in axonn/intra_layer/__init__.py
+        if hasattr(p, "is_tensor_parallel") and p.is_tensor_parallel:
+            if hasattr(p, "needs_depth_parallel_gradient_sync"):
+                if p.needs_depth_parallel_gradient_sync:
+                    tensor_parallel_biases.append((name, grad))
+                else:
+                    tensor_parallel_weights.append((name, grad))
+            else:
+                # conservative: treat as tensor-parallel weight
+                tensor_parallel_weights.append((name, grad))
+        else:
+            others.append((name, grad))
+
+    # For the purposes of data-parallel all-reduces, the following groups
+    # participate over the data-parallel group: others, tensor_parallel_weights,
+    # and tensor_parallel_biases (biases are reduced over both depth and data groups).
+    def bytes_of(tensor: torch.Tensor) -> int:
+        return int(tensor.numel() * tensor.element_size())
+
+    local_total = 0
+    for _, grad in others:
+        local_total += bytes_of(grad)
+    for _, grad in tensor_parallel_weights:
+        local_total += bytes_of(grad)
+    for _, grad in tensor_parallel_biases:
+        local_total += bytes_of(grad)
+
+    # Gather per-group-rank totals using AxoNN's data-parallel group
     try:
         device = next(model.parameters()).device
         tensor_device = device if device.type == "cuda" else torch.device("cpu")
@@ -96,12 +126,11 @@ def log_grad_message_sizes(model, top_n: int = 10) -> None:
 
     local = torch.tensor([local_total], dtype=torch.long, device=tensor_device)
     gathered = [torch.zeros_like(local) for _ in range(group_size)]
-    dist.all_gather(gathered, local, group=group)
+    dist.all_gather(gathered, local, group=data_parallel_group)
     gathered_ints = [int(x.item()) for x in gathered]
 
-    # Print per-group-rank totals from the group's rank 0
     if rank_in_group == 0:
-        print("[group-rank 0] per-group-rank allreduce bytes (approx):")
+        print("[group-rank 0] per-group-rank data-parallel allreduce bytes (approx):")
         for i, val in enumerate(gathered_ints):
             print(f"  rank {i}: {val} bytes ({val/1024**2:.3f} MB)")
 
