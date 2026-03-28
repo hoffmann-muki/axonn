@@ -48,6 +48,42 @@ def apply_topk_sparsification(model, topk_ratio=0.05):
         p.grad.copy_(new_grad.view(p.grad.shape))
 
 
+def log_grad_message_sizes(model, top_n=10):
+    """Log approximate all-reduce message sizes for parameter gradients (per-rank).
+
+    Prints total bytes and top-N largest gradient tensors by size.
+    """
+    # compute local total bytes
+    per = []
+    total_bytes = 0
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            continue
+        nbytes = p.grad.numel() * p.grad.element_size()
+        total_bytes += int(nbytes)
+        per.append((name, p.grad.shape, int(nbytes)))
+
+    # aggregate across ranks (use a GPU tensor if model is on GPU and dist backend is NCCL)
+    if dist.is_initialized():
+        try:
+            device = next(model.parameters()).device
+            tensor_device = device if device.type == "cuda" else torch.device("cpu")
+        except StopIteration:
+            tensor_device = torch.device("cpu")
+
+        local = torch.tensor([total_bytes], dtype=torch.long, device=tensor_device)
+        dist.all_reduce(local, op=dist.ReduceOp.SUM)
+        global_total = int(local.item())
+        rank = dist.get_rank()
+    else:
+        global_total = total_bytes
+        rank = 0
+
+    # print only aggregated total on rank 0 to avoid log flooding
+    if rank == 0:
+        print(f"[rank {rank}] allreduce total bytes (global, approx): {global_total} ({global_total/1024**2:.3f} MB)")
+
+
 def load_caltech256_dataset(root, split="train", transform=None):
     """Return the Caltech-256 dataset using torchvision's loader."""
     return datasets.Caltech256(root=root, transform=transform, download=False)
@@ -191,6 +227,13 @@ def train_vgg16_distributed(topk_ratio=0.0,
             logits = model(x)
             loss = loss_fn(logits, y)
             loss.backward()
+
+            # log approximate gradient all-reduce message sizes (rank 0 only)
+            try:
+                log_grad_message_sizes(model, top_n=8)
+            except Exception:
+                # don't fail training if logging has issues
+                pass
 
             # compute gradient norm
             total_norm = 0.0
