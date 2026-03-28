@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-"""Distributed training example: VGG16 on Places365 using AxoNN.
+"""Distributed training example: VGG16 on Caltech-256 using AxoNN.
 """
 
 import os
@@ -48,13 +48,32 @@ def apply_topk_sparsification(model, topk_ratio=0.05):
         p.grad.copy_(new_grad.view(p.grad.shape))
 
 
-def load_places365_dataset(root, split="train", transform=None):
-    """Return a torchvision ImageFolder for the given Places365 root/split.
+def load_caltech256_dataset(root, split="train", transform=None):
+    """Return the Caltech-256 dataset using torchvision's loader."""
+    return datasets.Caltech256(root=root, transform=transform, download=False)
 
-    Assumes the user provides a correct ImageFolder layout: <root>/<split>/<class>/*.jpg
-    """
-    split_path = os.path.join(root, split)
-    return datasets.ImageFolder(split_path, transform=transform)
+
+def ensure_caltech256_download(root):
+    """Download Caltech-256 on rank 0 and wait on other ranks."""
+    marker = os.path.join(root, ".caltech256_download_complete")
+    if os.path.exists(marker):
+        return
+
+    rank = int(os.environ.get("RANK", "0"))
+    if rank == 0:
+        os.makedirs(root, exist_ok=True)
+        print(f"Rank 0 downloading Caltech-256 into {root} (this may take a while)")
+        datasets.Caltech256(root=root, download=True)
+        # create sentinel
+        try:
+            with open(marker, "w") as f:
+                f.write("ok")
+        except Exception:
+            pass
+    else:
+        # wait for marker to appear
+        while not os.path.exists(marker):
+            time.sleep(1)
 
 def train_vgg16_distributed(topk_ratio=0.0,
                             batch_size_per_gpu=32,
@@ -63,14 +82,13 @@ def train_vgg16_distributed(topk_ratio=0.0,
                             pretrained=False,
                             dataset_root=None,
                             split="train",
-                            num_classes=365,
+                            num_classes=256,
                             num_workers=None):
     """
-    Distributed training routine for VGG16 on Places365 using AxoNN.
+    Distributed training routine for VGG16 on Caltech-256 using AxoNN.
 
-    Expects `dataset_root` to contain the dataset, either in Places365
-    layout (if torchvision.Places365 is available) or as
-    `dataset_root/<split>/<class_name>/*.jpg` for ImageFolder.
+    Expects `dataset_root` to point to the Caltech-256 dataset root as
+    required by `torchvision.datasets.Caltech256`.
     """
     # Configuration
     num_gpus = int(os.environ.get("WORLD_SIZE", "1"))
@@ -114,12 +132,10 @@ def train_vgg16_distributed(topk_ratio=0.0,
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    # Only rank 0 may perform dataset setup/download
-    # synchronize so all ranks wait for rank 0
     dist.barrier()
 
-    # load dataset on all ranks (assume correct layout)
-    train_dataset = load_places365_dataset(dataset_root, split=split, transform=train_transform)
+    # Load dataset on all ranks
+    train_dataset = load_caltech256_dataset(dataset_root, split=split, transform=train_transform)
 
     train_dataloader = ax.create_dataloader(
         dataset=train_dataset,
@@ -172,19 +188,22 @@ def train_vgg16_distributed(topk_ratio=0.0,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train VGG16 on Places365 with AxoNN")
+    parser = argparse.ArgumentParser(description="Train VGG16 on Caltech-256 with AxoNN")
     parser.add_argument("--topk", type=float, default=0.0, help="Fraction of gradients to keep via top-k sparsification (0 disables)")
     parser.add_argument("--batch-size-per-gpu", type=int, default=32, help="Per-GPU micro-batch size")
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=None, help="Base learning rate (linear scaling if omitted)")
     parser.add_argument("--pretrained", action="store_true", help="Use ImageNet-pretrained VGG16 weights")
-    parser.add_argument("--dataset-root", type=str, required=True, help="Path to Places365 root or ImageFolder layout")
+    parser.add_argument("--dataset-root", type=str, required=True, help="Path to Caltech-256 root (as expected by torchvision.datasets.Caltech256)")
     parser.add_argument("--split", type=str, default="train", help="Dataset split name (train or val)")
-    parser.add_argument("--num-classes", type=int, default=365, help="Number of target classes")
+    parser.add_argument("--num-classes", type=int, default=256, help="Number of target classes")
     parser.add_argument("--num-workers", type=int, default=None, help="Number of DataLoader workers per process")
+    parser.add_argument("--download", action="store_true", help="Download Caltech-256 into --dataset-root (rank 0 only)")
     parser.add_argument("--dry-run", action="store_true", help="Perform a CPU-only dry-run: validate dataset and model instantiation without distributed init or GPUs")
 
     args = parser.parse_args()
+    if args.download:
+        ensure_caltech256_download(args.dataset_root)
     if args.dry_run:
         # Dry-run: validate dataset and model on CPU
         print("Dry-run: validating dataset and model on CPU")
@@ -195,7 +214,7 @@ def main():
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
-        ds = load_places365_dataset(args.dataset_root, split=args.split, transform=tr)
+        ds = load_caltech256_dataset(args.dataset_root, split=args.split, transform=tr)
         loader = DataLoader(ds, batch_size=4, shuffle=False, num_workers=(args.num_workers or 0))
         # instantiate model on CPU
         weights = VGG16_Weights.IMAGENET1K_V1 if args.pretrained else None
