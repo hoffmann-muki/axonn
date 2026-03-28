@@ -113,6 +113,22 @@ def train_vgg16_distributed(topk_ratio=0.0,
         print(f"Global batch size: {global_batch_size}")
         print(f"Base LR: {base_lr:.6f}")
 
+    # Try to infer number of classes from the dataset
+    try:
+        tmp_ds = load_caltech256_dataset(dataset_root, split=split, transform=None)
+        inferred = None
+        if hasattr(tmp_ds, 'classes'):
+            inferred = len(tmp_ds.classes)
+        elif hasattr(tmp_ds, 'categories'):
+            inferred = len(tmp_ds.categories)
+        if inferred is not None and inferred > 0 and inferred != num_classes:
+            if rank == 0:
+                print(f"Adjusting num_classes from {num_classes} to {inferred} based on dataset")
+            num_classes = inferred
+    except Exception:
+        # dataset may not be available yet or loader may raise; continue with provided num_classes
+        pass
+
     # Instantiate VGG16 using modern weights API
     weights = VGG16_Weights.IMAGENET1K_V1 if pretrained else None
     model = models.vgg16(weights=weights).cuda()
