@@ -33,6 +33,14 @@ export CONDA_LIB_DIR=$CONDA_PREFIX/lib
 export CONDA_INCLUDE_DIR=$CONDA_PREFIX/include
 export NCCLX_BUILD_DIR="$NCCL_HOME"
 
+# Make torchrun discoverable from both the env and the base conda installation.
+export PATH="$CONDA_PREFIX/bin:$CONDA_BASE/bin:$PATH"
+TORCHRUN_BIN=$(command -v torchrun)
+if [ -z "$TORCHRUN_BIN" ]; then
+    echo "torchrun is not available on PATH after conda activation" >&2
+    exit 1
+fi
+
 # Ensure runtime linker can find NCCL, conda, and system libs (e.g., system OpenSSL for NCCLX)
 export LD_LIBRARY_PATH=$NCCL_HOME/lib:$CONDA_LIB_DIR:$LD_LIBRARY_PATH
 
@@ -96,8 +104,8 @@ export TORCH_HOME=/pscratch/sd/h/hmuki/.cache/torch
 export SPARSE_COMMS_BUILD_DIR=/pscratch/sd/h/hmuki/sparse_comms_build
 mkdir -p "$SPARSE_COMMS_BUILD_DIR"
 
-# Run distributed training with torchrun
-srun torchrun \
+# Run distributed training with torchrun once it has been made discoverable on PATH
+srun "$TORCHRUN_BIN" \
   --nnodes=2 \
   --nproc_per_node=4 \
   --rdzv_id=$SLURM_JOB_ID \
