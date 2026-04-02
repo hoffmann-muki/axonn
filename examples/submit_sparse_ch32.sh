@@ -94,6 +94,10 @@ export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
 export MASTER_PORT=29500
 export TORCH_HOME=/pscratch/sd/h/hmuki/.cache/torch
 
+# Ensure sparse_comms build cache directory exists and is writable
+export SPARSE_COMMS_BUILD_DIR=/pscratch/sd/h/hmuki/sparse_comms_build
+mkdir -p "$SPARSE_COMMS_BUILD_DIR"
+
 # Run distributed training with torchrun
 srun torchrun \
   --nnodes=2 \
