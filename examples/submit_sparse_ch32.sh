@@ -12,6 +12,9 @@
 
 set -euo pipefail
 
+# Provide default for QT to avoid unbound variable error during conda activation
+export QT_XCB_GL_INTEGRATION=${QT_XCB_GL_INTEGRATION:-offscreen}
+
 # activate conda env for torchcomms (initialize conda for non-interactive shells)
 if [ -f "$HOME/.bashrc" ]; then
   . "$HOME/.bashrc"
