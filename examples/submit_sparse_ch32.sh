@@ -81,11 +81,11 @@ export NCCL_CCD_CHANNELS=$NCHANNELS
 # export NCCL_MIN_NCHANNELS=$NCHANNELS
 export NCCL_MAX_NCHANNELS=$NCHANNELS
 
-# Create logs directory if it doesn't exist
-mkdir -p logs
-
 # Move to working directory on shared scratch
 cd /pscratch/sd/h/hmuki/axonn
+
+# Create logs directory in the working directory
+mkdir -p logs
 
 # Rendezvous and torch cache settings
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
