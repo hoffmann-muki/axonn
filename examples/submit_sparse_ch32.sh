@@ -16,16 +16,6 @@ SPARSITY=.99      # 0.0 = baseline, 0.99 = 99% pruning
 SAMPLE_PCT=0.01   # % of grad elements sampled for threshold (100=exact, lower=faster/approx)
 NCHANNELS=32  # pinned channel count for this sweep point
 
-# Ensure conda environment and NCCL/conda paths are set before other vars
-export NCCL_HOME=/pscratch/sd/h/hmuki/torchcomms/comms/ncclx/v2_29
-export CONDA_PREFIX=/pscratch/sd/h/hmuki/miniconda3/envs/torchcomms
-export CONDA_LIB_DIR=$CONDA_PREFIX/lib
-export CONDA_INCLUDE_DIR=$CONDA_PREFIX/include
-export NCCLX_BUILD_DIR="$NCCL_HOME"
-
-# Ensure runtime linker can find NCCL and conda libs
-export LD_LIBRARY_PATH=$NCCL_HOME/lib:$CONDA_LIB_DIR:$LD_LIBRARY_PATH
-
 # activate conda env for torchcomms (initialize conda for non-interactive shells)
 if [ -f "$HOME/.bashrc" ]; then
   . "$HOME/.bashrc"
@@ -37,6 +27,16 @@ fi
 
 conda activate torchcomms
 
+# Ensure conda environment and NCCL/conda paths are set before other vars
+export NCCL_HOME=/pscratch/sd/h/hmuki/torchcomms/build/ncclx
+export CONDA_PREFIX=/pscratch/sd/h/hmuki/miniconda3/envs/torchcomms
+export CONDA_LIB_DIR=$CONDA_PREFIX/lib
+export CONDA_INCLUDE_DIR=$CONDA_PREFIX/include
+export NCCLX_BUILD_DIR="$NCCL_HOME"
+
+# Ensure runtime linker can find NCCL and conda libs
+export LD_LIBRARY_PATH=$NCCL_HOME/lib:$CONDA_LIB_DIR:$LD_LIBRARY_PATH
+
 export USE_SPARSE_RS=0
 export USE_SPARSE_AR=1
 export AXONN_PRUNE_RS=0
@@ -46,8 +46,7 @@ export AXONN_PRUNE_SAMPLE_PCT=$SAMPLE_PCT
 export SPARSE_COMMS_LOG_SPARSITY=0
 export NCCL_RS_SHIM_TIMING=0
 export NCCL_RS_SHIM_STATS=0
-
-# exports 
+ 
 # use ncclx
 export LD_PRELOAD="$NCCL_HOME/lib/libnccl.so.2"
 
