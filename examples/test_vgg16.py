@@ -187,6 +187,7 @@ def ensure_caltech256_download(root):
             time.sleep(1)
 
 def train_vgg16_distributed(topk_ratio=0.0,
+                            prune_sample_pct=None,
                             batch_size_per_gpu=32,
                             num_epochs=30,
                             base_lr=None,
@@ -220,11 +221,11 @@ def train_vgg16_distributed(topk_ratio=0.0,
 
     gradient_pruner = None
     if topk_ratio is not None and 0.0 < topk_ratio < 1.0:
-        # sample_pct and sparsity defaults may be provided via environment
-        # (submit_sparse_ch64.sh exports AXONN_PRUNE_SAMPLE_PCT and AXONN_PRUNE_SPARSITY)
-        sample_pct_env = os.environ.get("AXONN_PRUNE_SAMPLE_PCT") or os.environ.get("SAMPLE_PCT")
+        # Determine sample_pct for approximate thresholding.
+        # Preference order: env `AXONN_PRUNE_SAMPLE_PCT` -> CLI `prune_sample_pct` -> default 10.0
+        sample_pct_env = os.environ.get("AXONN_PRUNE_SAMPLE_PCT")
         try:
-            sample_pct = float(sample_pct_env) if sample_pct_env is not None else 10.0
+            sample_pct = float(sample_pct_env) if sample_pct_env is not None else prune_sample_pct if prune_sample_pct is not None else 10.0
         except Exception:
             sample_pct = 10.0
 
@@ -425,6 +426,7 @@ def train_vgg16_distributed(topk_ratio=0.0,
 def main():
     parser = argparse.ArgumentParser(description="Train VGG16 on Caltech-256 with AxoNN")
     parser.add_argument("--topk", type=float, default=0.0, help="Fraction of gradients to keep via top-k sparsification (0 disables)")
+    parser.add_argument("--prune-sample-pct", type=float, default=None, help="Sample percent for GradientPruner threshold estimation (0-100). Overrides AXONN_PRUNE_SAMPLE_PCT env var")
     parser.add_argument("--batch-size-per-gpu", type=int, default=32, help="Per-GPU micro-batch size")
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=None, help="Base learning rate (linear scaling if omitted)")
@@ -480,6 +482,7 @@ def main():
 
         train_vgg16_distributed(
             topk_ratio=args.topk,
+            prune_sample_pct=args.prune_sample_pct,
             batch_size_per_gpu=args.batch_size_per_gpu,
             num_epochs=args.epochs,
             base_lr=args.lr,
