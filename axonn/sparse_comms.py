@@ -30,7 +30,10 @@ _HERE = Path(__file__).parent.resolve()
 _NCCLX_BUILD_DIR = Path(
     os.environ.get(
         "NCCLX_BUILD_DIR",
-        "/pscratch/sd/e/egencer/sparsecomms/torchcomms-sparse/build/ncclx",
+        os.environ.get(
+            "NCCL_HOME",
+            "/pscratch/sd/h/hmuki/torchcomms/build/ncclx",
+        ),
     )
 )
 _NCCLX_INCLUDE = str(_NCCLX_BUILD_DIR / "include")

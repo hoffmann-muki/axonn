@@ -1,6 +1,33 @@
+#!/bin/bash
+#SBATCH --nodes=4
+#SBATCH --ntasks-per-node=4
+#SBATCH --gpus-per-node=4
+#SBATCH --constraint=gpu
+#SBATCH --qos=regular
+#SBATCH --time=01:00:00
+#SBATCH --account=m5083_g
+#SBATCH --job-name=sparse_ch64
+#SBATCH --output=logs/sparse_ch64_%j.out
+#SBATCH --error=logs/sparse_ch64_%j.err
+
+set -euo pipefail
+
 SPARSITY=.99      # 0.0 = baseline, 0.99 = 99% pruning
 SAMPLE_PCT=0.01   # % of grad elements sampled for threshold (100=exact, lower=faster/approx)
 NCHANNELS=32  # pinned channel count for this sweep point
+
+# Ensure conda environment and NCCL/conda paths are set before other vars
+export NCCL_HOME=/pscratch/sd/h/hmuki/torchcomms/comms/ncclx/v2_29
+export CONDA_PREFIX=/pscratch/sd/h/hmuki/miniconda3/envs/torchcomms
+export CONDA_LIB_DIR=$CONDA_PREFIX/lib
+export CONDA_INCLUDE_DIR=$CONDA_PREFIX/include
+export NCCLX_BUILD_DIR="$NCCL_HOME"
+
+# Ensure runtime linker can find NCCL and conda libs
+export LD_LIBRARY_PATH=$NCCL_HOME/lib:$CONDA_LIB_DIR:$LD_LIBRARY_PATH
+
+# activate conda env for torchcomms
+conda activate torchcomms
 
 export USE_SPARSE_RS=0
 export USE_SPARSE_AR=1
@@ -12,13 +39,10 @@ export SPARSE_COMMS_LOG_SPARSITY=0
 export NCCL_RS_SHIM_TIMING=0
 export NCCL_RS_SHIM_STATS=0
 
-# export 
-# use ncclx 
-export LD_PRELOAD="/pscratch/sd/e/egencer/sparsecomms/torchcomms-sparse/build/ncclx/lib/libnccl.so.2"
-# use stock nccl with shim to add symbols for sparse collectives
-# export LD_PRELOAD="/pscratch/sd/e/egencer/sparsecomms/Megatron-AxoNN/libnccl_sparse_stub.so"
+# exports 
+# use ncclx
+export LD_PRELOAD="$NCCL_HOME/lib/libnccl.so.2"
 
-# export LD_PRELOAD="/pscratch/sd/e/egencer/sparsecomms/Megatron-AxoNN/libnccl_sparse_stub.so"
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=INIT,NET
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -50,3 +74,28 @@ export NCCL_CCD_DENSE_INTRA_THRESHOLD=0.7
 export NCCL_CCD_CHANNELS=$NCHANNELS
 # export NCCL_MIN_NCHANNELS=$NCHANNELS
 export NCCL_MAX_NCHANNELS=$NCHANNELS
+
+# Create logs directory if it doesn't exist
+mkdir -p logs
+
+# Move to working directory on shared scratch
+cd /pscratch/sd/h/hmuki/axonn
+
+# Rendezvous and torch cache settings
+export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
+export MASTER_PORT=29500
+export TORCH_HOME=/pscratch/sd/h/hmuki/.cache/torch
+
+# Run distributed training with torchrun
+srun torchrun \
+  --nnodes=4 \
+  --nproc_per_node=4 \
+  --rdzv_id=$SLURM_JOB_ID \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
+  examples/test_vgg16.py \
+  --dataset-root /pscratch/sd/h/hmuki/axonn/caltech256 \
+  --split train \
+  --batch-size-per-gpu 1 \
+  --epochs 2 \
+  --pretrained

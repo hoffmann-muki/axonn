@@ -23,6 +23,7 @@ import time
 import argparse
 
 import torch
+from typing import Optional
 import torch.distributed as dist
 import torchvision.models as models
 import torchvision.datasets as datasets
@@ -198,7 +199,7 @@ def train_vgg16_distributed(topk_ratio=0.0,
                             num_workers=None,
                             optimizer_name="adamw",
                             log_grad_messages: bool = False,
-                            use_sparse_collectives: bool = None):
+                            use_sparse_collectives: Optional[bool] = None):
     """
     Distributed training routine for VGG16 on Caltech-256 using AxoNN.
 
@@ -266,6 +267,12 @@ def train_vgg16_distributed(topk_ratio=0.0,
         print(f"Initialized distributed training on {world_size} processes (GPUs)")
         print(f"Global batch size: {global_batch_size}")
         print(f"Base LR: {base_lr:.6f}")
+        # Log key CLI arguments and environment variables used by this run
+        print(f"  topk={topk_ratio}, prune_sample_pct={prune_sample_pct}, batch_size_per_gpu={batch_size_per_gpu}, optimizer={optimizer_name}")
+        print(f"  Resolved collectives mode (CLI/env): use_sparse={use_sparse}")
+        print(f"  ENV: AXONN_PRUNE_SPARSITY={os.environ.get('AXONN_PRUNE_SPARSITY')}, AXONN_PRUNE_SAMPLE_PCT={os.environ.get('AXONN_PRUNE_SAMPLE_PCT')}")
+        print(f"  ENV: USE_SPARSE_AR={os.environ.get('USE_SPARSE_AR')}, USE_SPARSE_AG={os.environ.get('USE_SPARSE_AG')}")
+        print(f"  ENV: NCCLX_BUILD_DIR={os.environ.get('NCCLX_BUILD_DIR')}, NCCL_HOME={os.environ.get('NCCL_HOME')}, LD_PRELOAD={os.environ.get('LD_PRELOAD')}")
 
     # Try to infer number of classes from the dataset
     try:
