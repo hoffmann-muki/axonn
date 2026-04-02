@@ -26,7 +26,15 @@ export NCCLX_BUILD_DIR="$NCCL_HOME"
 # Ensure runtime linker can find NCCL and conda libs
 export LD_LIBRARY_PATH=$NCCL_HOME/lib:$CONDA_LIB_DIR:$LD_LIBRARY_PATH
 
-# activate conda env for torchcomms
+# activate conda env for torchcomms (initialize conda for non-interactive shells)
+if [ -f "$HOME/.bashrc" ]; then
+  . "$HOME/.bashrc"
+elif [ -f "$HOME/.bash_profile" ]; then
+  . "$HOME/.bash_profile"
+elif command -v conda >/dev/null 2>&1; then
+  eval "$(conda shell.bash hook)"
+fi
+
 conda activate torchcomms
 
 export USE_SPARSE_RS=0
