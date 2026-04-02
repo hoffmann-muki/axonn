@@ -13,7 +13,7 @@ Notes:
 - Use ``--dataset-root`` to point to Caltech-256 or ``--download`` to
     fetch the dataset on rank 0.
 - This example logs aggregated gradient-message sizes when enabled via
-    ``--log-grad-sizes``; the logging uses AxoNN's data-parallel group
+    ``--log-grad-messages``; the logging uses AxoNN's data-parallel group
     and will be skipped if AxoNN is not initialized.
 """
 
@@ -33,33 +33,81 @@ from torch.optim.lr_scheduler import LinearLR, SequentialLR, CosineAnnealingLR
 from torch.utils.data import DataLoader
 
 from axonn import axonn as ax
+from axonn.gradient_pruner import GradientPruner
 
-@torch.no_grad()
-def apply_topk_sparsification(model, topk_ratio: float = 0.05) -> None:
-    """Sparsify gradients in-place by keeping the largest magnitudes.
+_SPARSE_COMMS = None
 
-    For each parameter, keep the largest ``topk_ratio`` fraction of
-    gradient elements (by absolute value) and zero the remainder.
-    """
-    for p in model.parameters():
-        if p.grad is None:
+
+def _load_sparse_comms():
+    """Load sparse collective bindings."""
+    global _SPARSE_COMMS
+    if _SPARSE_COMMS is None:
+        from axonn import sparse_comms as sparse_comms_mod
+
+        _SPARSE_COMMS = sparse_comms_mod
+    return _SPARSE_COMMS
+
+
+def _collect_data_parallel_grads(model):
+    """Return gradients that are reduced across AxoNN data-parallel group."""
+    grads = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        grad = getattr(p, "grad", None)
+        if grad is None:
             continue
 
-        grad_flat = p.grad.view(-1)
-        total_elements = grad_flat.numel()
+        # Mirrors AxoNN's sync_gradients contract for tensor-parallel params.
+        if hasattr(p, "is_tensor_parallel") and p.is_tensor_parallel:
+            if not hasattr(p, "needs_depth_parallel_gradient_sync"):
+                raise ValueError(
+                    f"Tensor-parallel parameter '{name}' is missing needs_depth_parallel_gradient_sync"
+                )
 
-        k = max(1, int(total_elements * topk_ratio))
-
-        _, indices = torch.topk(grad_flat.abs(), k)
-
-        topk_values = grad_flat[indices]
-        new_grad = torch.zeros_like(grad_flat)
-        new_grad.scatter_(0, indices, topk_values)
-
-        p.grad.copy_(new_grad.view(p.grad.shape))
+        grads.append((name, grad))
+    return grads
 
 
-def log_grad_message_sizes(model, top_n: int = 10) -> None:
+@torch.no_grad()
+def sync_gradients_data_parallel(model, sparse_comms_mod, use_sparse: bool, mean: bool = True) -> None:
+    """Synchronize gradients across AxoNN data-parallel ranks using sparse AR or dense collectives.
+
+    When `use_sparse` is True and `sparse_comms_mod` is available this uses
+    the sparse binder's `all_reduce_sparse`. Otherwise it falls back to
+    `torch.distributed.all_reduce` on AxoNN's data-parallel group.
+    """
+    if not (dist.is_initialized() and hasattr(ax, "comm_handle") and getattr(ax.comm_handle, "data_parallel_group", None) is not None):
+        return
+
+    data_parallel_group = ax.comm_handle.data_parallel_group
+    group_size = ax.comm_handle.G_data
+    grads = _collect_data_parallel_grads(model)
+
+    if use_sparse and sparse_comms_mod is not None:
+        handles = []
+        for _, grad in grads:
+            handle = sparse_comms_mod.all_reduce_sparse(
+                grad,
+                group=data_parallel_group,
+                async_op=True,
+            )
+            if handle is not None:
+                handles.append(handle)
+
+        for handle in handles:
+            handle.wait()
+    else:
+        # Dense fallback using torch.distributed
+        for _, grad in grads:
+            dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=data_parallel_group)
+
+    if mean and group_size > 1:
+        scale = 1.0 / float(group_size)
+        for _, grad in grads:
+            grad.mul_(scale)
+
+def log_grad_message_sizes(model, sparse_comms_mod, use_sparse: bool) -> None:
     """Compute and report per-data-parallel-rank gradient-message sizes.
 
     This computes the approximate number of bytes that would be communicated
@@ -72,50 +120,19 @@ def log_grad_message_sizes(model, top_n: int = 10) -> None:
     # data-parallel group.
     if not (dist.is_initialized() and hasattr(ax, "comm_handle") and getattr(ax.comm_handle, "data_parallel_group", None) is not None):
         if dist.is_initialized() and dist.get_rank() == 0:
-            print("AxoNN data-parallel group unavailable; skipping grad-size logging")
+            print("AxoNN data-parallel group unavailable — skipping gradient-size logging")
         return
 
     data_parallel_group = ax.comm_handle.data_parallel_group
     group_size = ax.comm_handle.G_data
     rank_in_group = ax.comm_handle.data_parallel_rank
 
-    tensor_parallel_weights = []
-    tensor_parallel_biases = []
-    others = []
+    grads = _collect_data_parallel_grads(model)
 
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        grad = getattr(p, "grad", None)
-        if grad is None:
-            continue
-
-        # Behavior mirrors `sync_gradients` in axonn/intra_layer/__init__.py
-        if hasattr(p, "is_tensor_parallel") and p.is_tensor_parallel:
-            if hasattr(p, "needs_depth_parallel_gradient_sync"):
-                if p.needs_depth_parallel_gradient_sync:
-                    tensor_parallel_biases.append((name, grad))
-                else:
-                    tensor_parallel_weights.append((name, grad))
-            else:
-                # conservative: treat as tensor-parallel weight
-                tensor_parallel_weights.append((name, grad))
-        else:
-            others.append((name, grad))
-
-    # For the purposes of data-parallel all-reduces, the following groups
-    # participate over the data-parallel group: others, tensor_parallel_weights,
-    # and tensor_parallel_biases (biases are reduced over both depth and data groups).
     def bytes_of(tensor: torch.Tensor) -> int:
         return int(tensor.numel() * tensor.element_size())
 
-    local_total = 0
-    for _, grad in others:
-        local_total += bytes_of(grad)
-    for _, grad in tensor_parallel_weights:
-        local_total += bytes_of(grad)
-    for _, grad in tensor_parallel_biases:
-        local_total += bytes_of(grad)
+    local_total = sum(bytes_of(grad) for _, grad in grads)
 
     # Gather per-group-rank totals using AxoNN's data-parallel group
     try:
@@ -125,12 +142,19 @@ def log_grad_message_sizes(model, top_n: int = 10) -> None:
         tensor_device = torch.device("cpu")
 
     local = torch.tensor([local_total], dtype=torch.long, device=tensor_device)
-    gathered = [torch.zeros_like(local) for _ in range(group_size)]
-    dist.all_gather(gathered, local, group=data_parallel_group)
-    gathered_ints = [int(x.item()) for x in gathered]
+    if use_sparse and sparse_comms_mod is not None:
+        # use binder's all_gather_sparse when available
+        gathered = torch.empty(group_size, dtype=torch.long, device=tensor_device)
+        sparse_comms_mod.all_gather_sparse(local, gathered, group=data_parallel_group, async_op=False)
+        gathered_ints = [int(x.item()) for x in gathered]
+    else:
+        # Dense fallback using torch.distributed.all_gather
+        gathered_list = [torch.zeros(1, dtype=torch.long, device=tensor_device) for _ in range(group_size)]
+        dist.all_gather(gathered_list, local, group=data_parallel_group)
+        gathered_ints = [int(x.item()) for x in gathered_list]
 
     if rank_in_group == 0:
-        print("[group-rank 0] per-group-rank data-parallel allreduce bytes (approx):")
+        print("Per-data-parallel-rank all-reduce byte counts (approx):")
         for i, val in enumerate(gathered_ints):
             print(f"  rank {i}: {val} bytes ({val/1024**2:.3f} MB)")
 
@@ -172,7 +196,8 @@ def train_vgg16_distributed(topk_ratio=0.0,
                             num_classes=256,
                             num_workers=None,
                             optimizer_name="adamw",
-                            log_grad_messages: bool = False):
+                            log_grad_messages: bool = False,
+                            use_sparse_collectives: bool = None):
     """
     Distributed training routine for VGG16 on Caltech-256 using AxoNN.
 
@@ -193,16 +218,51 @@ def train_vgg16_distributed(topk_ratio=0.0,
     if num_workers is None:
         num_workers = min(8, (os.cpu_count() or 4))
 
+    gradient_pruner = None
+    if topk_ratio is not None and 0.0 < topk_ratio < 1.0:
+        # sample_pct and sparsity defaults may be provided via environment
+        # (submit_sparse_ch64.sh exports AXONN_PRUNE_SAMPLE_PCT and AXONN_PRUNE_SPARSITY)
+        sample_pct_env = os.environ.get("AXONN_PRUNE_SAMPLE_PCT") or os.environ.get("SAMPLE_PCT")
+        try:
+            sample_pct = float(sample_pct_env) if sample_pct_env is not None else 10.0
+        except Exception:
+            sample_pct = 10.0
+
+        sparsity_env = os.environ.get("AXONN_PRUNE_SPARSITY")
+        try:
+            sparsity = float(sparsity_env) if sparsity_env is not None else 1.0 - topk_ratio
+        except Exception:
+            sparsity = 1.0 - topk_ratio
+
+        gradient_pruner = GradientPruner(sparsity=sparsity, sample_pct=sample_pct)
+
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
 
     ax.init(G_data=num_gpus, G_inter=1)
 
+    # Determine whether to use sparse collectives. CLI can override these
+    # defaults; otherwise respect environment variables (submit script exports).
+    if use_sparse_collectives is None:
+        use_sparse = os.environ.get("USE_SPARSE_AR", "1") == "1" or os.environ.get("USE_SPARSE_AG", "1") == "1"
+    else:
+        use_sparse = bool(use_sparse_collectives)
+
+    sparse_comms_mod = None
+    if use_sparse:
+        try:
+            sparse_comms_mod = _load_sparse_comms()
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to load axonn.sparse_comms. Ensure NCCLX/NCCL build paths are set "
+                "(e.g., NCCLX_BUILD_DIR) before running distributed training."
+            ) from exc
+
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
     if rank == 0:
-        print(f"Initialized distributed training on {world_size} GPUs")
+        print(f"Initialized distributed training on {world_size} processes (GPUs)")
         print(f"Global batch size: {global_batch_size}")
         print(f"Base LR: {base_lr:.6f}")
 
@@ -236,7 +296,7 @@ def train_vgg16_distributed(topk_ratio=0.0,
 
     # VGG input transforms (224x224, ImageNet normalization)
     train_transform = transforms.Compose([
-        # Ensure images are RGB to avoid grayscale corruption from some datasets
+        # Ensure images are RGB to avoid grayscale images from some datasets
         transforms.Lambda(lambda img: img.convert("RGB") if hasattr(img, "convert") else img),
         transforms.RandomResizedCrop(224),
         transforms.RandomHorizontalFlip(),
@@ -280,12 +340,12 @@ def train_vgg16_distributed(topk_ratio=0.0,
             loss = loss_fn(logits, y)
             loss.backward()
 
-            # optionally log approximate gradient-message sizes (aggregated by AxoNN)
+            # Optionally log approximate gradient-message sizes (aggregated by AxoNN).
+            # Suppress logging errors so that training is not interrupted.
             if log_grad_messages:
                 try:
-                    log_grad_message_sizes(model, top_n=8)
+                    log_grad_message_sizes(model, sparse_comms_mod, use_sparse=use_sparse)
                 except Exception:
-                    # don't fail training if logging has issues
                     pass
 
             # compute gradient norm
@@ -296,8 +356,14 @@ def train_vgg16_distributed(topk_ratio=0.0,
                     total_norm += param_norm.item() ** 2
             total_norm = total_norm ** 0.5
 
-            if topk_ratio is not None and 0.0 < topk_ratio < 1.0:
-                apply_topk_sparsification(model, topk_ratio=topk_ratio)
+            if gradient_pruner is not None:
+                for param in model.parameters():
+                    if param.grad is None:
+                        continue
+                    gradient_pruner.prune(param.grad, key=param.data_ptr())
+
+            # synchronize gradients across data-parallel ranks
+            sync_gradients_data_parallel(model, sparse_comms_mod, use_sparse=use_sparse, mean=True)
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
@@ -311,7 +377,7 @@ def train_vgg16_distributed(topk_ratio=0.0,
             train_correct += int((preds == y).sum().item())
             train_total += x.size(0)
 
-            # print per-batch info including grad norm (rank 0 only)
+            # Print per-batch statistics (only on rank 0).
             if rank == 0:
                 current_lr = optimizer.param_groups[0]['lr']
                 print(f"  Batch {batch_idx+1}: loss = {batch_loss:.6f} | LR = {current_lr:.6e} | grad_norm = {total_norm:.6f}")
@@ -349,7 +415,7 @@ def train_vgg16_distributed(topk_ratio=0.0,
                 print(f"Validation Acc = {val_acc:.2f}% ({val_correct}/{val_total})")
             model.train()
         except Exception:
-            # skip validation if loader doesn't support 'val' or data not present
+            # Skip validation if the 'val' split is unavailable or loader raises an error.
             if rank == 0:
                 print("Validation skipped (no 'val' split or loader error)")
 
@@ -370,6 +436,8 @@ def main():
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["sgd","adamw"], help="Optimizer to use (sgd or adamw)")
     parser.add_argument("--download", action="store_true", help="Download Caltech-256 into --dataset-root (rank 0 only)")
     parser.add_argument("--log-grad-messages", action="store_true", dest="log_grad_messages", help="Enable aggregated gradient-message-size logging (prints per-data-parallel-rank totals on AxoNN group-rank 0)")
+    parser.add_argument("--sparse-collectives", action="store_true", dest="sparse_collectives", help="Use sparse collectives (overrides env vars)")
+    parser.add_argument("--dense-collectives", action="store_true", dest="dense_collectives", help="Use dense collectives (overrides env vars)")
     parser.add_argument("--dry-run", action="store_true", help="Perform a CPU-only dry-run: validate dataset and model instantiation without distributed init or GPUs")
 
     args = parser.parse_args()
@@ -401,6 +469,15 @@ def main():
                 break
         print("Dry-run completed successfully")
     else:
+        # Determine collectives mode: CLI overrides env defaults from submit script.
+        if args.sparse_collectives:
+            use_sparse = True
+        elif args.dense_collectives:
+            use_sparse = False
+        else:
+            # follow the submit script defaults: prefer sparse if env not set (script sets USE_SPARSE_AR/AG=1)
+            use_sparse = os.environ.get("USE_SPARSE_AR", "1") == "1" or os.environ.get("USE_SPARSE_AG", "1") == "1"
+
         train_vgg16_distributed(
             topk_ratio=args.topk,
             batch_size_per_gpu=args.batch_size_per_gpu,
@@ -413,6 +490,7 @@ def main():
             num_workers=args.num_workers,
             optimizer_name=args.optimizer,
             log_grad_messages=args.log_grad_messages,
+            use_sparse_collectives=use_sparse,
         )
 
 
