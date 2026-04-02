@@ -34,7 +34,7 @@ export CONDA_LIB_DIR=$CONDA_PREFIX/lib
 export CONDA_INCLUDE_DIR=$CONDA_PREFIX/include
 export NCCLX_BUILD_DIR="$NCCL_HOME"
 
-# Ensure runtime linker can find NCCL and conda libs
+# Ensure runtime linker can find NCCL, conda, and system libs (e.g., system OpenSSL for NCCLX)
 export LD_LIBRARY_PATH=$NCCL_HOME/lib:$CONDA_LIB_DIR:$LD_LIBRARY_PATH
 
 export USE_SPARSE_RS=0
