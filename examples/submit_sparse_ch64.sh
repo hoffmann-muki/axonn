@@ -1,8 +1,9 @@
 #!/bin/bash
-#SBATCH --nodes=4
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
-#SBATCH --constraint=gpu
+#SBATCH --exclusive
+#SBATCH --constraint="gpu\&hbm40g"
 #SBATCH --qos=regular
 #SBATCH --time=01:00:00
 #SBATCH --account=m5083_g
@@ -88,7 +89,7 @@ export TORCH_HOME=/pscratch/sd/h/hmuki/.cache/torch
 
 # Run distributed training with torchrun
 srun torchrun \
-  --nnodes=4 \
+  --nnodes=2 \
   --nproc_per_node=4 \
   --rdzv_id=$SLURM_JOB_ID \
   --rdzv_backend=c10d \
