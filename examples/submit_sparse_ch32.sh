@@ -12,10 +12,6 @@
 
 set -euo pipefail
 
-SPARSITY=.99      # 0.0 = baseline, 0.99 = 99% pruning
-SAMPLE_PCT=0.01   # % of grad elements sampled for threshold (100=exact, lower=faster/approx)
-NCHANNELS=32  # pinned channel count for this sweep point
-
 # activate conda env for torchcomms (initialize conda for non-interactive shells)
 if [ -f "$HOME/.bashrc" ]; then
   . "$HOME/.bashrc"
@@ -26,6 +22,10 @@ elif command -v conda >/dev/null 2>&1; then
 fi
 
 conda activate torchcomms
+
+SPARSITY=.99      # 0.0 = baseline, 0.99 = 99% pruning
+SAMPLE_PCT=0.01   # % of grad elements sampled for threshold (100=exact, lower=faster/approx)
+NCHANNELS=32  # pinned channel count for this sweep point
 
 # Ensure conda environment and NCCL/conda paths are set before other vars
 export NCCL_HOME=/pscratch/sd/h/hmuki/torchcomms/build/ncclx
