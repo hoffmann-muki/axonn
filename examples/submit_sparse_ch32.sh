@@ -116,4 +116,5 @@ srun "$TORCHRUN_BIN" \
   --split train \
   --batch-size-per-gpu 2 \
   --epochs 2 \
+  --sparse-collectives \
   --pretrained
