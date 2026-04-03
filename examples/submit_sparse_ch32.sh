@@ -21,7 +21,10 @@ else
 fi
 
 export SYS_SYSROOT=${SYS_SYSROOT:-}
+export BUILD=${BUILD:-}
+set +u
 conda activate torchcomms
+set -u
 
 SPARSITY=.99      # 0.0 = baseline, 0.99 = 99% pruning
 SAMPLE_PCT=0.01   # % of grad elements sampled for threshold (100=exact, lower=faster/approx)
