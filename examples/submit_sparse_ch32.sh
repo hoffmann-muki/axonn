@@ -6,7 +6,7 @@
 #SBATCH --qos=regular
 #SBATCH --time=01:00:00
 #SBATCH --account=m5083_g
-#SBATCH --job-name=sparse_ch32
+#SBATCH --job-name=sparse_ch32_%j
 #SBATCH --output=logs/sparse_ch32_%j.out
 #SBATCH --error=logs/sparse_ch32_%j.err
 
