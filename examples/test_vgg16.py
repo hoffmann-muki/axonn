@@ -34,9 +34,23 @@ from torch.optim.lr_scheduler import LinearLR, SequentialLR, CosineAnnealingLR
 from torch.utils.data import DataLoader
 
 from axonn import axonn as ax
-from axonn.gradient_pruner import GradientPruner
+from axonn.trition_pruner import TritonGradientPruner
 
 _SPARSE_COMMS = None
+
+
+def _resolve_sparse_collective_modes(use_sparse_collectives: Optional[bool] = None):
+    """Resolve per-op sparse collective modes from CLI intent or environment."""
+    if use_sparse_collectives is True:
+        return {"USE_SPARSE_RS": True, "USE_SPARSE_AR": True, "USE_SPARSE_AG": True}
+    if use_sparse_collectives is False:
+        return {"USE_SPARSE_RS": False, "USE_SPARSE_AR": False, "USE_SPARSE_AG": False}
+
+    return {
+        "USE_SPARSE_RS": os.environ.get("USE_SPARSE_RS", "0") == "1",
+        "USE_SPARSE_AR": os.environ.get("USE_SPARSE_AR", "0") == "1",
+        "USE_SPARSE_AG": os.environ.get("USE_SPARSE_AG", "0") == "1",
+    }
 
 
 def _load_sparse_comms():
@@ -236,19 +250,17 @@ def train_vgg16_distributed(topk_ratio=0.0,
         except Exception:
             sparsity = 1.0 - topk_ratio
 
-        gradient_pruner = GradientPruner(sparsity=sparsity, sample_pct=sample_pct)
+        gradient_pruner = TritonGradientPruner(sparsity=sparsity, sample_pct=sample_pct)
 
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
 
     ax.init(G_data=num_gpus, G_inter=1)
 
-    # Determine whether to use sparse collectives. CLI can override these
-    # defaults; otherwise respect environment variables (submit script exports).
-    if use_sparse_collectives is None:
-        use_sparse = os.environ.get("USE_SPARSE_AR", "1") == "1" or os.environ.get("USE_SPARSE_AG", "1") == "1"
-    else:
-        use_sparse = bool(use_sparse_collectives)
+    # Determine whether to use sparse collectives. Dense is the default unless
+    # the caller explicitly enables sparse or the environment requests it.
+    sparse_modes = _resolve_sparse_collective_modes(use_sparse_collectives)
+    use_sparse = any(sparse_modes.values())
 
     sparse_comms_mod = None
     if use_sparse:
@@ -270,6 +282,12 @@ def train_vgg16_distributed(topk_ratio=0.0,
         # Log key CLI arguments and environment variables used by this run
         print(f"  topk={topk_ratio}, prune_sample_pct={prune_sample_pct}, batch_size_per_gpu={batch_size_per_gpu}, optimizer={optimizer_name}")
         print(f"  Resolved collectives mode (CLI/env): use_sparse={use_sparse}")
+        print(
+            "  Resolved per-op sparse modes: "
+            f"RS={sparse_modes['USE_SPARSE_RS']}, "
+            f"AR={sparse_modes['USE_SPARSE_AR']}, "
+            f"AG={sparse_modes['USE_SPARSE_AG']}"
+        )
         print(f"  ENV: AXONN_PRUNE_SPARSITY={os.environ.get('AXONN_PRUNE_SPARSITY')}, AXONN_PRUNE_SAMPLE_PCT={os.environ.get('AXONN_PRUNE_SAMPLE_PCT')}")
         print(f"  ENV: USE_SPARSE_AR={os.environ.get('USE_SPARSE_AR')}, USE_SPARSE_AG={os.environ.get('USE_SPARSE_AG')}")
         print(f"  ENV: NCCLX_BUILD_DIR={os.environ.get('NCCLX_BUILD_DIR')}, NCCL_HOME={os.environ.get('NCCL_HOME')}, LD_PRELOAD={os.environ.get('LD_PRELOAD')}")
@@ -433,7 +451,7 @@ def train_vgg16_distributed(topk_ratio=0.0,
 def main():
     parser = argparse.ArgumentParser(description="Train VGG16 on Caltech-256 with AxoNN")
     parser.add_argument("--topk", type=float, default=0.0, help="Fraction of gradients to keep via top-k sparsification (0 disables)")
-    parser.add_argument("--prune-sample-pct", type=float, default=None, help="Sample percent for GradientPruner threshold estimation (0-100). Overrides AXONN_PRUNE_SAMPLE_PCT env var")
+    parser.add_argument("--prune-sample-pct", type=float, default=None, help="Sample percent for TritonGradientPruner threshold estimation (0-100). Overrides AXONN_PRUNE_SAMPLE_PCT env var")
     parser.add_argument("--batch-size-per-gpu", type=int, default=32, help="Per-GPU micro-batch size")
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=None, help="Base learning rate (linear scaling if omitted)")
@@ -450,6 +468,15 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Perform a CPU-only dry-run: validate dataset and model instantiation without distributed init or GPUs")
 
     args = parser.parse_args()
+    if args.sparse_collectives and args.dense_collectives:
+        parser.error("--sparse-collectives and --dense-collectives are mutually exclusive")
+
+    requested_modes = _resolve_sparse_collective_modes(
+        True if args.sparse_collectives else False if args.dense_collectives else None,
+    )
+    for env_name, enabled in requested_modes.items():
+        os.environ[env_name] = "1" if enabled else "0"
+
     if args.download:
         ensure_caltech256_download(args.dataset_root)
         print("Caltech-256 download complete (--download); exiting.")
@@ -484,8 +511,8 @@ def main():
         elif args.dense_collectives:
             use_sparse = False
         else:
-            # follow the submit script defaults: prefer sparse if env not set (script sets USE_SPARSE_AR/AG=1)
-            use_sparse = os.environ.get("USE_SPARSE_AR", "1") == "1" or os.environ.get("USE_SPARSE_AG", "1") == "1"
+            # follow the resolved environment defaults: dense unless sparse was explicitly enabled
+            use_sparse = any(requested_modes.values())
 
         train_vgg16_distributed(
             topk_ratio=args.topk,

@@ -4,7 +4,7 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --constraint="gpu\&hbm40g"
 #SBATCH --qos=regular
-#SBATCH --time=00:30:00
+#SBATCH --time=01:00:00
 #SBATCH --account=m5083_g
 #SBATCH --job-name=sparse_ch32
 #SBATCH --output=logs/sparse_ch32_%j.out
@@ -27,7 +27,7 @@ SAMPLE_PCT=0.01   # % of grad elements sampled for threshold (100=exact, lower=f
 NCHANNELS=32  # pinned channel count for this sweep point
 
 # Ensure conda environment and NCCL/conda paths are set before other vars
-export NCCL_HOME=/pscratch/sd/h/hmuki/torchcomms/build/ncclx
+export NCCL_HOME=/pscratch/sd/h/hmuki/torchcomms-sparse/build/ncclx
 export CONDA_PREFIX=/pscratch/sd/h/hmuki/miniconda3/envs/torchcomms
 export CONDA_LIB_DIR=$CONDA_PREFIX/lib
 export CONDA_INCLUDE_DIR=$CONDA_PREFIX/include
@@ -42,7 +42,7 @@ if [ -z "$TORCHRUN_BIN" ]; then
 fi
 
 # Ensure runtime linker can find NCCL, conda, and system libs (e.g., system OpenSSL for NCCLX)
-export LD_LIBRARY_PATH=$NCCL_HOME/lib:$CONDA_LIB_DIR:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=$NCCL_HOME/lib:$LD_LIBRARY_PATH:$CONDA_LIB_DIR
 
 export USE_SPARSE_RS=0
 export USE_SPARSE_AR=1
@@ -98,7 +98,7 @@ mkdir -p logs
 # Rendezvous and torch cache settings
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
 export MASTER_PORT=29500
-export TORCH_HOME=/pscratch/sd/h/hmuki/.cache/torch
+export TORCH_HOME=/pscratch/sd/h/hmuki/.cache_general/torch
 
 # Ensure sparse_comms build cache directory exists and is writable
 export SPARSE_COMMS_BUILD_DIR=/pscratch/sd/h/hmuki/sparse_comms_build
@@ -114,6 +114,6 @@ srun "$TORCHRUN_BIN" \
   examples/test_vgg16.py \
   --dataset-root /pscratch/sd/h/hmuki/axonn/caltech256 \
   --split train \
-  --batch-size-per-gpu 1 \
+  --batch-size-per-gpu 2 \
   --epochs 2 \
   --pretrained
