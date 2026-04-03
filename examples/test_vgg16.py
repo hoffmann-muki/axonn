@@ -253,6 +253,8 @@ def train_vgg16_distributed(topk_ratio=0.0,
         gradient_pruner = TritonGradientPruner(sparsity=sparsity, sample_pct=sample_pct)
 
     if not dist.is_initialized():
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank)
         dist.init_process_group(backend="nccl")
 
     ax.init(G_data=num_gpus, G_inter=1)
@@ -330,7 +332,7 @@ def train_vgg16_distributed(topk_ratio=0.0,
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    dist.barrier()
+    dist.barrier(device_ids=[torch.cuda.current_device()])
 
     # Load dataset on all ranks
     train_dataset = load_caltech256_dataset(dataset_root, split=split, transform=train_transform)
