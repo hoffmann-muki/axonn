@@ -28,7 +28,7 @@ set -u
 
 SPARSITY=.99      # 0.0 = baseline, 0.99 = 99% pruning
 SAMPLE_PCT=0.01   # % of grad elements sampled for threshold (100=exact, lower=faster/approx)
-NCHANNELS=32  # pinned channel count for this sweep point
+NCHANNELS=64  # pinned channel count for this sweep point
 
 # Use SLURM_NNODES
 NNODES=${SLURM_NNODES:-1}
