@@ -63,7 +63,6 @@ _ext = _cpp_load(
         f"-L{_NCCLX_LIB_DIR}",
         "-lnccl",
         f"-Wl,-rpath,{_NCCLX_LIB_DIR}",
-        "-lcuda",
     ],
     build_directory=_BUILD_DIR,
     verbose=False,
