@@ -20,6 +20,7 @@ else
     eval "$(conda shell.bash hook)"
 fi
 
+export SYS_SYSROOT=${SYS_SYSROOT:-}
 conda activate torchcomms
 
 SPARSITY=.99      # 0.0 = baseline, 0.99 = 99% pruning
