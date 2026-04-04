@@ -63,6 +63,11 @@ def _load_sparse_comms():
     return _SPARSE_COMMS
 
 
+def _cuda_timing_event_pair():
+    """Create a CUDA start/end event pair for elapsed-time measurement."""
+    return torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+
+
 def _collect_data_parallel_grads(model):
     """Return gradients that are reduced across AxoNN data-parallel group."""
     grads = []
@@ -359,11 +364,17 @@ def train_vgg16_distributed(topk_ratio=0.0,
     for epoch in range(num_epochs):
         epoch_loss = 0.0
         epoch_start = time.time()
+        epoch_prune_time_ms = 0.0
+        epoch_allreduce_time_ms = 0.0
+        epoch_compute_time_ms = 0.0
         train_correct = 0
         train_total = 0
 
         for batch_idx, (x, y) in enumerate(tqdm(train_dataloader, disable=(rank != 0), desc=f"Epoch {epoch+1}/{num_epochs}")):
             x, y = x.cuda(), y.cuda()
+
+            compute_start, compute_end = _cuda_timing_event_pair()
+            compute_start.record()
 
             optimizer.zero_grad()
             logits = model(x)
@@ -387,17 +398,37 @@ def train_vgg16_distributed(topk_ratio=0.0,
             total_norm = total_norm ** 0.5
 
             if gradient_pruner is not None:
+                prune_start, prune_end = _cuda_timing_event_pair()
+                prune_start.record()
                 for param in model.parameters():
                     if param.grad is None:
                         continue
                     gradient_pruner.prune(param.grad, key=param.data_ptr())
+                prune_end.record()
+            else:
+                prune_start = prune_end = None
 
             # synchronize gradients across data-parallel ranks
+            allreduce_start, allreduce_end = _cuda_timing_event_pair()
+            allreduce_start.record()
             sync_gradients_data_parallel(model, sparse_comms_mod, use_sparse=use_sparse, mean=True)
+            allreduce_end.record()
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
             scheduler.step()
+
+            compute_end.record()
+            compute_end.synchronize()
+
+            compute_time_ms = compute_start.elapsed_time(compute_end)
+            prune_time_ms = prune_start.elapsed_time(prune_end) if prune_start is not None else 0.0
+            allreduce_time_ms = allreduce_start.elapsed_time(allreduce_end)
+            compute_rest_time_ms = max(0.0, compute_time_ms - prune_time_ms - allreduce_time_ms)
+
+            epoch_compute_time_ms += compute_time_ms
+            epoch_prune_time_ms += prune_time_ms
+            epoch_allreduce_time_ms += allreduce_time_ms
 
             batch_loss = float(loss.item())
             epoch_loss += batch_loss
@@ -411,11 +442,13 @@ def train_vgg16_distributed(topk_ratio=0.0,
             if rank == 0:
                 current_lr = optimizer.param_groups[0]['lr']
                 print(f"  Batch {batch_idx+1}: loss = {batch_loss:.6f} | LR = {current_lr:.6e} | grad_norm = {total_norm:.6f}")
+                print(f"    Timing (ms, CUDA events): allreduce={allreduce_time_ms:.3f}, prune={prune_time_ms:.3f}, compute={compute_rest_time_ms:.3f}")
 
         if rank == 0:
             avg_loss = epoch_loss / max(1, len(train_dataloader))
             train_acc = 100.0 * train_correct / max(1, train_total)
             print(f"Epoch {epoch+1}: Average loss = {avg_loss:.4f}, Train Acc = {train_acc:.2f}%, Duration = {time.time()-epoch_start:.2f}s")
+            print(f"Epoch timing summary (ms, CUDA events): allreduce_total={epoch_allreduce_time_ms:.3f}, prune_total={epoch_prune_time_ms:.3f}, compute_total={max(0.0, epoch_compute_time_ms-epoch_prune_time_ms-epoch_allreduce_time_ms):.3f}")
 
         # Validation (optional): try to load 'val' split and evaluate
         try:
