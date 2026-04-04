@@ -360,6 +360,10 @@ def train_vgg16_distributed(topk_ratio=0.0,
     scheduler2 = CosineAnnealingLR(optimizer, T_max=max(1, total_steps - warmup_steps))
     scheduler = SequentialLR(optimizer, schedulers=[scheduler1, scheduler2], milestones=[warmup_steps])
 
+    run_prune_time_ms = 0.0
+    run_allreduce_time_ms = 0.0
+    run_compute_time_ms = 0.0
+
     # Training loop
     for epoch in range(num_epochs):
         epoch_loss = 0.0
@@ -426,6 +430,9 @@ def train_vgg16_distributed(topk_ratio=0.0,
             allreduce_time_ms = allreduce_start.elapsed_time(allreduce_end)
             compute_rest_time_ms = max(0.0, compute_time_ms - prune_time_ms - allreduce_time_ms)
 
+            run_compute_time_ms += compute_time_ms
+            run_prune_time_ms += prune_time_ms
+            run_allreduce_time_ms += allreduce_time_ms
             epoch_compute_time_ms += compute_time_ms
             epoch_prune_time_ms += prune_time_ms
             epoch_allreduce_time_ms += allreduce_time_ms
@@ -442,13 +449,13 @@ def train_vgg16_distributed(topk_ratio=0.0,
             if rank == 0:
                 current_lr = optimizer.param_groups[0]['lr']
                 print(f"  Batch {batch_idx+1}: loss = {batch_loss:.6f} | LR = {current_lr:.6e} | grad_norm = {total_norm:.6f}")
-                print(f"    Timing (ms, CUDA events): allreduce={allreduce_time_ms:.3f}, prune={prune_time_ms:.3f}, compute={compute_rest_time_ms:.3f}")
+                print(f"    Timing (ms, CUDA events): allreduce={allreduce_time_ms:.6f}, prune={prune_time_ms:.6f}, compute={compute_rest_time_ms:.6f}")
 
         if rank == 0:
             avg_loss = epoch_loss / max(1, len(train_dataloader))
             train_acc = 100.0 * train_correct / max(1, train_total)
             print(f"Epoch {epoch+1}: Average loss = {avg_loss:.4f}, Train Acc = {train_acc:.2f}%, Duration = {time.time()-epoch_start:.2f}s")
-            print(f"Epoch timing summary (ms, CUDA events): allreduce_total={epoch_allreduce_time_ms:.3f}, prune_total={epoch_prune_time_ms:.3f}, compute_total={max(0.0, epoch_compute_time_ms-epoch_prune_time_ms-epoch_allreduce_time_ms):.3f}")
+            print(f"Epoch timing summary (ms, CUDA events): allreduce_total={epoch_allreduce_time_ms:.6f}, prune_total={epoch_prune_time_ms:.6f}, compute_total={max(0.0, epoch_compute_time_ms-epoch_prune_time_ms-epoch_allreduce_time_ms):.6f}")
 
         # Validation (optional): try to load 'val' split and evaluate
         try:
@@ -481,6 +488,14 @@ def train_vgg16_distributed(topk_ratio=0.0,
             # Skip validation if the 'val' split is unavailable or loader raises an error.
             if rank == 0:
                 print("Validation skipped (no 'val' split or loader error)")
+
+    if rank == 0:
+        print(
+            "Run timing summary (ms, CUDA events): "
+            f"allreduce_total={run_allreduce_time_ms:.6f}, "
+            f"prune_total={run_prune_time_ms:.6f}, "
+            f"compute_total={max(0.0, run_compute_time_ms-run_prune_time_ms-run_allreduce_time_ms):.6f}"
+        )
 
     dist.destroy_process_group()
 
