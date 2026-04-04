@@ -26,7 +26,8 @@ set +u
 conda activate torchcomms
 set -u
 
-SPARSITY=.99      # 0.0 = baseline, 0.99 = 99% pruning
+SPARSITY=${SPARSITY:-.99}      # 0.0 = baseline, 0.99 = 99% pruning
+TOPK=0
 SAMPLE_PCT=0.01   # % of grad elements sampled for threshold (100=exact, lower=faster/approx)
 NCHANNELS=32  # pinned channel count for this sweep point
 
@@ -133,5 +134,6 @@ srun -N $NNODES -n $NNODES --ntasks-per-node=1 \
   --split train \
   --batch-size-per-gpu 2 \
   --epochs 2 \
+    --topk "$TOPK" \
   --dense-collectives \
   --pretrained | tee logs/caltech_256_${NNODES}_${NCHANNELS}.log

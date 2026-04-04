@@ -592,14 +592,17 @@ def main():
         # Determine collectives mode: CLI overrides env defaults from submit script.
         if args.sparse_collectives:
             use_sparse = True
+            topk_ratio = args.topk
         elif args.dense_collectives:
             use_sparse = False
+            topk_ratio = 0.0
         else:
             # follow the resolved environment defaults: dense unless sparse was explicitly enabled
             use_sparse = any(requested_modes.values())
+            topk_ratio = args.topk
 
         train_vgg16_distributed(
-            topk_ratio=args.topk,
+            topk_ratio=topk_ratio,
             prune_sample_pct=args.prune_sample_pct,
             batch_size_per_gpu=args.batch_size_per_gpu,
             num_epochs=args.epochs,

@@ -26,7 +26,8 @@ set +u
 conda activate torchcomms
 set -u
 
-SPARSITY=.99      # 0.0 = baseline, 0.99 = 99% pruning
+SPARSITY=${SPARSITY:-.99}      # 0.0 = baseline, 0.99 = 99% pruning
+TOPK=$(awk -v sparsity="$SPARSITY" 'BEGIN {printf "%.6f", 1 - sparsity}')
 SAMPLE_PCT=0.01   # % of grad elements sampled for threshold (100=exact, lower=faster/approx)
 NCHANNELS=64  # pinned channel count for this sweep point
 
@@ -133,5 +134,6 @@ srun -N $NNODES -n $NNODES --ntasks-per-node=1 \
   --split train \
   --batch-size-per-gpu 2 \
   --epochs 2 \
-  --sparse-collectives \
+    --topk "$TOPK" \
+    --sparse-collectives \
   --pretrained | tee logs/caltech_256_${NNODES}_${SPARSITY}_${SAMPLE_PCT}_${NCHANNELS}.log
