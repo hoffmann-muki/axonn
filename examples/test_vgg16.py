@@ -63,6 +63,21 @@ def _load_sparse_comms():
     return _SPARSE_COMMS
 
 
+def _resolve_prune_sample_pct(prune_sample_pct: Optional[float]) -> tuple[float, str]:
+    """Resolve the pruning sample percentage and report where it came from."""
+    sample_pct_env = os.environ.get("AXONN_PRUNE_SAMPLE_PCT")
+    if sample_pct_env is not None:
+        try:
+            return float(sample_pct_env), "env:AXONN_PRUNE_SAMPLE_PCT"
+        except Exception:
+            pass
+
+    if prune_sample_pct is not None:
+        return float(prune_sample_pct), "cli:--prune-sample-pct"
+
+    return 10.0, "default:10.0"
+
+
 def _cuda_timing_event_pair():
     """Create a CUDA start/end event pair for elapsed-time measurement."""
     return torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
@@ -241,15 +256,12 @@ def train_vgg16_distributed(topk_ratio=0.0,
     if num_workers is None:
         num_workers = min(8, (os.cpu_count() or 4))
 
+    resolved_prune_sample_pct, resolved_prune_sample_pct_source = _resolve_prune_sample_pct(prune_sample_pct)
+
     gradient_pruner = None
     if topk_ratio is not None and 0.0 < topk_ratio < 1.0:
         # Determine sample_pct for approximate thresholding.
-        # Preference order: env `AXONN_PRUNE_SAMPLE_PCT` -> CLI `prune_sample_pct` -> default 10.0
-        sample_pct_env = os.environ.get("AXONN_PRUNE_SAMPLE_PCT")
-        try:
-            sample_pct = float(sample_pct_env) if sample_pct_env is not None else prune_sample_pct if prune_sample_pct is not None else 10.0
-        except Exception:
-            sample_pct = 10.0
+        sample_pct = resolved_prune_sample_pct
 
         sparsity_env = os.environ.get("AXONN_PRUNE_SPARSITY")
         try:
@@ -289,7 +301,10 @@ def train_vgg16_distributed(topk_ratio=0.0,
         print(f"Global batch size: {global_batch_size}")
         print(f"Base LR: {base_lr:.6f}")
         # Log key CLI arguments and environment variables used by this run
-        print(f"  topk={topk_ratio}, prune_sample_pct={prune_sample_pct}, batch_size_per_gpu={batch_size_per_gpu}, optimizer={optimizer_name}")
+        print(
+            f"  topk={topk_ratio}, prune_sample_pct={resolved_prune_sample_pct:.6f} "
+            f"(source={resolved_prune_sample_pct_source}), batch_size_per_gpu={batch_size_per_gpu}, optimizer={optimizer_name}"
+        )
         print(f"  Resolved collectives mode (CLI/env): use_sparse={use_sparse}")
         print(
             "  Resolved per-op sparse modes: "
