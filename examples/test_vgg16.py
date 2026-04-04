@@ -431,7 +431,6 @@ def train_vgg16_distributed(topk_ratio=0.0,
             compute_end.synchronize()
 
             compute_time_ms = compute_start.elapsed_time(compute_end)
-            prune_time_ms = prune_start.elapsed_time(prune_end) if prune_start is not None else 0.0
             allreduce_time_ms = allreduce_start.elapsed_time(allreduce_end)
             if prune_timing_records:
                 prune_sample_time_ms = sum(t["sample_start"].elapsed_time(t["sample_end"]) for t in prune_timing_records)
