@@ -361,6 +361,9 @@ def train_vgg16_distributed(topk_ratio=0.0,
     scheduler = SequentialLR(optimizer, schedulers=[scheduler1, scheduler2], milestones=[warmup_steps])
 
     run_prune_time_ms = 0.0
+    run_prune_sample_time_ms = 0.0
+    run_prune_threshold_time_ms = 0.0
+    run_prune_kernel_time_ms = 0.0
     run_allreduce_time_ms = 0.0
     run_compute_time_ms = 0.0
 
@@ -369,6 +372,9 @@ def train_vgg16_distributed(topk_ratio=0.0,
         epoch_loss = 0.0
         epoch_start = time.time()
         epoch_prune_time_ms = 0.0
+        epoch_prune_sample_time_ms = 0.0
+        epoch_prune_threshold_time_ms = 0.0
+        epoch_prune_kernel_time_ms = 0.0
         epoch_allreduce_time_ms = 0.0
         epoch_compute_time_ms = 0.0
         train_correct = 0
@@ -402,15 +408,14 @@ def train_vgg16_distributed(topk_ratio=0.0,
             total_norm = total_norm ** 0.5
 
             if gradient_pruner is not None:
-                prune_start, prune_end = _cuda_timing_event_pair()
-                prune_start.record()
+                prune_timing_records = []
                 for param in model.parameters():
                     if param.grad is None:
                         continue
-                    gradient_pruner.prune(param.grad, key=param.data_ptr())
-                prune_end.record()
+                    _, prune_timing = gradient_pruner.prune(param.grad, key=param.data_ptr(), return_timing=True)
+                    prune_timing_records.append(prune_timing)
             else:
-                prune_start = prune_end = None
+                prune_timing_records = []
 
             # synchronize gradients across data-parallel ranks
             allreduce_start, allreduce_end = _cuda_timing_event_pair()
@@ -428,13 +433,29 @@ def train_vgg16_distributed(topk_ratio=0.0,
             compute_time_ms = compute_start.elapsed_time(compute_end)
             prune_time_ms = prune_start.elapsed_time(prune_end) if prune_start is not None else 0.0
             allreduce_time_ms = allreduce_start.elapsed_time(allreduce_end)
+            if prune_timing_records:
+                prune_sample_time_ms = sum(t["sample_start"].elapsed_time(t["sample_end"]) for t in prune_timing_records)
+                prune_threshold_time_ms = sum(t["threshold_start"].elapsed_time(t["threshold_end"]) for t in prune_timing_records)
+                prune_kernel_time_ms = sum(t["prune_start"].elapsed_time(t["prune_end"]) for t in prune_timing_records)
+            else:
+                prune_sample_time_ms = 0.0
+                prune_threshold_time_ms = 0.0
+                prune_kernel_time_ms = 0.0
+
+            prune_time_ms = prune_sample_time_ms + prune_threshold_time_ms + prune_kernel_time_ms
             compute_rest_time_ms = max(0.0, compute_time_ms - prune_time_ms - allreduce_time_ms)
 
             run_compute_time_ms += compute_time_ms
             run_prune_time_ms += prune_time_ms
+            run_prune_sample_time_ms += prune_sample_time_ms
+            run_prune_threshold_time_ms += prune_threshold_time_ms
+            run_prune_kernel_time_ms += prune_kernel_time_ms
             run_allreduce_time_ms += allreduce_time_ms
             epoch_compute_time_ms += compute_time_ms
             epoch_prune_time_ms += prune_time_ms
+            epoch_prune_sample_time_ms += prune_sample_time_ms
+            epoch_prune_threshold_time_ms += prune_threshold_time_ms
+            epoch_prune_kernel_time_ms += prune_kernel_time_ms
             epoch_allreduce_time_ms += allreduce_time_ms
 
             batch_loss = float(loss.item())
@@ -456,6 +477,11 @@ def train_vgg16_distributed(topk_ratio=0.0,
             train_acc = 100.0 * train_correct / max(1, train_total)
             print(f"Epoch {epoch+1}: Average loss = {avg_loss:.4f}, Train Acc = {train_acc:.2f}%, Duration = {time.time()-epoch_start:.2f}s")
             print(f"Epoch timing summary (ms, CUDA events): allreduce_total={epoch_allreduce_time_ms:.6f}, prune_total={epoch_prune_time_ms:.6f}, compute_total={max(0.0, epoch_compute_time_ms-epoch_prune_time_ms-epoch_allreduce_time_ms):.6f}")
+            if gradient_pruner is not None:
+                print(
+                    f"Epoch prune breakdown (ms, CUDA events): sample_total={epoch_prune_sample_time_ms:.6f}, "
+                    f"threshold_total={epoch_prune_threshold_time_ms:.6f}, kernel_total={epoch_prune_kernel_time_ms:.6f}"
+                )
 
         # Validation (optional): try to load 'val' split and evaluate
         try:
@@ -496,6 +522,13 @@ def train_vgg16_distributed(topk_ratio=0.0,
             f"prune_total={run_prune_time_ms:.6f}, "
             f"compute_total={max(0.0, run_compute_time_ms-run_prune_time_ms-run_allreduce_time_ms):.6f}"
         )
+        if gradient_pruner is not None:
+            print(
+                "Run prune breakdown (ms, CUDA events): "
+                f"sample_total={run_prune_sample_time_ms:.6f}, "
+                f"threshold_total={run_prune_threshold_time_ms:.6f}, "
+                f"kernel_total={run_prune_kernel_time_ms:.6f}"
+            )
 
     dist.destroy_process_group()
 

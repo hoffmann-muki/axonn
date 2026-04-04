@@ -9,6 +9,10 @@ import triton.language as tl
 # =============================================================================
 
 
+def _cuda_timing_event_pair():
+    return torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+
+
 @triton.jit
 def prune_kernel(
     input_ptr,
@@ -120,7 +124,7 @@ class TritonGradientPruner:
         self._temp_sample: dict = {}
 
     @torch.no_grad()
-    def prune(self, tensor: torch.Tensor, key=0) -> torch.Tensor:
+    def prune(self, tensor: torch.Tensor, key=0, return_timing: bool = False):
         """
         Prune tensor in-place with error feedback using Triton kernel.
 
@@ -153,6 +157,8 @@ class TritonGradientPruner:
         BLOCK_SIZE = 1024
         grid = (triton.cdiv(n_sample_elems, BLOCK_SIZE),)
         seed = torch.randint(0, 2**31, (1,)).item()
+        sample_start, sample_end = _cuda_timing_event_pair()
+        sample_start.record()
         sample_kernel[grid](
             tensor,
             sample_out,
@@ -161,14 +167,19 @@ class TritonGradientPruner:
             seed,
             BLOCK_SIZE=BLOCK_SIZE,
         )
-        
+        sample_end.record()
         
         k = max(1, int(n_sample_elems * self.sparsity))
+        threshold_start, threshold_end = _cuda_timing_event_pair()
+        threshold_start.record()
         threshold = torch.kthvalue(sample_out, k)[0]
+        threshold_end.record()
         
         # Launch Triton kernel (computes threshold internally)
         BLOCK_SIZE = 1024
         grid = (triton.cdiv(n, BLOCK_SIZE),)
+        prune_start, prune_end = _cuda_timing_event_pair()
+        prune_start.record()
         prune_kernel[grid](
             tensor,
             tensor,
@@ -179,7 +190,20 @@ class TritonGradientPruner:
             self.sparsity,
             BLOCK_SIZE=BLOCK_SIZE,
         )
+        prune_end.record()
 
+        timing = {
+            "sample_start": sample_start,
+            "sample_end": sample_end,
+            "threshold_start": threshold_start,
+            "threshold_end": threshold_end,
+            "prune_start": prune_start,
+            "prune_end": prune_end,
+        }
+        self.last_timing_events = timing
+
+        if return_timing:
+            return tensor, timing
         return tensor
 
     def clear_error(self):
