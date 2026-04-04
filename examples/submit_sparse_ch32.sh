@@ -33,7 +33,7 @@ NCHANNELS=32  # pinned channel count for this sweep point
 NNODES=${SLURM_NNODES:-1}
 
 # Load the system NCCL module to get the network plugin (libnccl-net.so)
-module load nccl/2.24.3
+module load nccl/2.29.2-cu13
 
 # Ensure conda environment and NCCL/conda paths are set before other vars
 NCCL_HOME=/pscratch/sd/h/hmuki/torchcomms-sparse/build/ncclx
@@ -112,7 +112,7 @@ cd /pscratch/sd/h/hmuki/axonn
 mkdir -p logs
 
 # Rendezvous and torch cache settings
-export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
+export MASTER_ADDR=$(nodeset -e $SLURM_JOB_NODELIST | cut -d' ' -f1)
 export MASTER_PORT=29500
 export TORCH_HOME=/pscratch/sd/h/hmuki/.cache_general/torch
 
