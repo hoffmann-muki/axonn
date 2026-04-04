@@ -33,6 +33,9 @@ NCHANNELS=32  # pinned channel count for this sweep point
 # Use SLURM_NNODES
 NNODES=${SLURM_NNODES:-1}
 
+# Load the system NCCL module to get the network plugin (libnccl-net.so)
+module load nccl/2.24.3
+
 # Ensure conda environment and NCCL/conda paths are set before other vars
 NCCL_HOME=/pscratch/sd/h/hmuki/torchcomms-sparse/build/ncclx
 export CONDA_PREFIX=/pscratch/sd/h/hmuki/miniconda3/envs/torchcomms
