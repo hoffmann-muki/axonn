@@ -112,7 +112,7 @@ def sync_gradients_data_parallel(model, sparse_comms_mod, use_sparse: bool, mean
                 group=data_parallel_group,
                 async_op=True,
             )
-            print(f"Initiated sparse all-reduce for grad with {grad.numel()} elements ({grad.element_size() * grad.numel()} bytes)")
+            # print(f"Initiated sparse all-reduce for grad with {grad.numel()} elements ({grad.element_size() * grad.numel()} bytes)")
             if handle is not None:
                 handles.append(handle)
 
@@ -120,7 +120,7 @@ def sync_gradients_data_parallel(model, sparse_comms_mod, use_sparse: bool, mean
             handle.wait()
     else:
         # Dense fallback using torch.distributed
-        print("Using dense all-reduce for gradients")
+        # print("Using dense all-reduce for gradients")
         for _, grad in grads:
             dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=data_parallel_group)
 
