@@ -4,7 +4,7 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --constraint="gpu\&hbm40g"
 #SBATCH --qos=regular
-#SBATCH --time=01:00:00
+#SBATCH --time=00:20:00
 #SBATCH --account=m5083_g
 #SBATCH --job-name=sparse_ch64_%j
 #SBATCH --output=logs/sparse_ch64_%j.out
