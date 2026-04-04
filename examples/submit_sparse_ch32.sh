@@ -30,7 +30,6 @@ SPARSITY=.99      # 0.0 = baseline, 0.99 = 99% pruning
 SAMPLE_PCT=0.01   # % of grad elements sampled for threshold (100=exact, lower=faster/approx)
 NCHANNELS=32  # pinned channel count for this sweep point
 
-# Use SLURM_NNODES
 NNODES=${SLURM_NNODES:-1}
 
 # Load the system NCCL module to get the network plugin (libnccl-net.so)
@@ -122,7 +121,8 @@ export SPARSE_COMMS_BUILD_DIR=/pscratch/sd/h/hmuki/sparse_comms_build
 mkdir -p "$SPARSE_COMMS_BUILD_DIR"
 
 # Run distributed training with torchrun once it has been made discoverable on PATH
-srun "$TORCHRUN_BIN" \
+srun -N $NNODES -n $NNODES --ntasks-per-node=1 \
+  $TORCHRUN_BIN \
   --nnodes=$NNODES \
   --nproc_per_node=4 \
   --rdzv_id=$SLURM_JOB_ID \
