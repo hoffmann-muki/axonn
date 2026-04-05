@@ -56,9 +56,12 @@ def prune_kernel(
     
     zeros = tl.zeros_like(x)
 
+    # Keep only top-magnitude entries in the tensor.
     tl.store(input_ptr + offsets, zeros, mask=(mask & (~m)))
 
-    tl.store(error_ptr + offsets, x, mask=(mask & m))
+    # Error-feedback stores dropped values; kept values get zero residual.
+    tl.store(error_ptr + offsets, zeros, mask=(mask & m))
+    tl.store(error_ptr + offsets, x, mask=(mask & (~m)))
 
     
 
@@ -151,7 +154,9 @@ class TritonGradientPruner:
         if key in self._error:
             error_buffer = self._error[key]
         else:
-            error_buffer = torch.empty_like(tensor)
+            # Initialize residual buffer to zeros; uninitialized values would
+            # corrupt future error-feedback updates.
+            error_buffer = torch.zeros_like(tensor)
             self._error[key] = error_buffer
 
         BLOCK_SIZE = 1024

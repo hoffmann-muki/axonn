@@ -140,7 +140,7 @@ def sync_gradients_data_parallel(
     if use_sparse and sparse_comms_mod is not None:
         # Bucket gradients to reduce number of prune kernels and collectives.
         # Buckets group tensors by device and dtype and aim for ~BUCKET_BYTES per bucket.
-        BUCKET_BYTES = int(os.environ.get("AXONN_GRAD_BUCKET_BYTES", str(8 * 1024 * 1024)))
+        BUCKET_BYTES = int(os.environ.get("AXONN_GRAD_BUCKET_BYTES", str(600 * 1024 * 1024)))
         buckets = []
         cur_bucket = []
         cur_bytes = 0
@@ -247,12 +247,11 @@ def sync_gradients_data_parallel(
     return stats
 
 def log_grad_message_sizes(model, sparse_comms_mod, use_sparse: bool) -> None:
-    """Compute and report per-data-parallel-rank gradient-message sizes.
+    """Compute and report rank-0 gradient-message size guidance for bucketing.
 
-    This computes the approximate number of bytes that would be communicated
-    during an all-reduce of gradients for ``model``. The function requires
-    AxoNN's data-parallel group (``ax.comm_handle.data_parallel_group``)
-    and will skip logging if AxoNN is not initialized.
+    This reports the dense-equivalent gradient bytes on rank 0 only,
+    along with an estimated bucket count from ``AXONN_GRAD_BUCKET_BYTES``.
+    It intentionally avoids per-rank prints to keep logs concise.
     """
     # Classify gradients the same way AxoNN's `sync_gradients` does, so
     # we count only those gradients that will be reduced over the
@@ -262,9 +261,10 @@ def log_grad_message_sizes(model, sparse_comms_mod, use_sparse: bool) -> None:
             print("AxoNN data-parallel group unavailable — skipping gradient-size logging")
         return
 
-    data_parallel_group = ax.comm_handle.data_parallel_group
-    group_size = ax.comm_handle.G_data
     rank_in_group = ax.comm_handle.data_parallel_rank
+
+    if rank_in_group != 0:
+        return
 
     grads = _collect_data_parallel_grads(model)
 
@@ -273,28 +273,18 @@ def log_grad_message_sizes(model, sparse_comms_mod, use_sparse: bool) -> None:
 
     local_total = sum(bytes_of(grad) for _, _, grad in grads)
 
-    # Gather per-group-rank totals using AxoNN's data-parallel group
-    try:
-        device = next(model.parameters()).device
-        tensor_device = device if device.type == "cuda" else torch.device("cpu")
-    except StopIteration:
-        tensor_device = torch.device("cpu")
-
     if not use_sparse or sparse_comms_mod is None:
-        if rank_in_group == 0:
-            print("Sparse collectives unavailable — skipping gradient-size logging")
+        print("Sparse collectives unavailable — skipping gradient-size logging")
         return
 
-    local = torch.tensor([local_total], dtype=torch.long, device=tensor_device)
-    # use binder's all_gather_sparse when available
-    gathered = torch.empty(group_size, dtype=torch.long, device=tensor_device)
-    sparse_comms_mod.all_gather_sparse(local, gathered, group=data_parallel_group, async_op=False)
-    gathered_ints = [int(x.item()) for x in gathered]
-
-    if rank_in_group == 0:
-        print("Per-data-parallel-rank all-reduce byte counts (approx):")
-        for i, val in enumerate(gathered_ints):
-            print(f"  rank {i}: {val} bytes ({val/1024**2:.3f} MB)")
+    bucket_bytes = int(os.environ.get("AXONN_GRAD_BUCKET_BYTES", str(8 * 1024 * 1024)))
+    est_buckets = max(1, (local_total + bucket_bytes - 1) // bucket_bytes)
+    print(
+        "Gradient message size (rank 0, dense-equivalent): "
+        f"{local_total} bytes ({local_total/1024**2:.3f} MB), "
+        f"bucket_target={bucket_bytes/1024**2:.2f} MB, "
+        f"estimated_bucket_count={est_buckets}"
+    )
 
 
 def load_caltech256_dataset(root, split="train", transform=None):
@@ -509,7 +499,7 @@ def train_vgg16_distributed(topk_ratio=0.0,
 
             # Optionally log approximate gradient-message sizes (aggregated by AxoNN).
             # Suppress logging errors so that training is not interrupted.
-            if log_grad_messages:
+            if log_grad_messages and batch_idx == 0:
                 try:
                     log_grad_message_sizes(model, sparse_comms_mod, use_sparse=use_sparse)
                 except Exception:
