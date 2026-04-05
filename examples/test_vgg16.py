@@ -138,25 +138,93 @@ def sync_gradients_data_parallel(
     }
 
     if use_sparse and sparse_comms_mod is not None:
-        handles = []
-        for _, param, grad in grads:
-            if gradient_pruner is not None:
-                _, prune_timing = gradient_pruner.prune(grad, key=param.data_ptr(), return_timing=True)
-                stats["prune_sample_ms"] += prune_timing["sample_start"].elapsed_time(prune_timing["sample_end"])
-                stats["prune_threshold_ms"] += prune_timing["threshold_start"].elapsed_time(prune_timing["threshold_end"])
-                stats["prune_kernel_ms"] += prune_timing["prune_start"].elapsed_time(prune_timing["prune_end"])
+        # Bucket gradients to reduce number of prune kernels and collectives.
+        # Buckets group tensors by device and dtype and aim for ~BUCKET_BYTES per bucket.
+        BUCKET_BYTES = int(os.environ.get("AXONN_GRAD_BUCKET_BYTES", str(8 * 1024 * 1024)))
+        buckets = []
+        cur_bucket = []
+        cur_bytes = 0
 
+        def flush_bucket():
+            nonlocal cur_bucket, cur_bytes
+            if cur_bucket:
+                buckets.append(cur_bucket)
+            cur_bucket = []
+            cur_bytes = 0
+
+        # Build buckets (keep device/dtype homogeneous within a bucket)
+        first_device = None
+        first_dtype = None
+        for name, param, grad in grads:
+            if grad is None:
+                continue
+            elem_bytes = int(grad.element_size() * grad.numel())
+            if not cur_bucket:
+                cur_bucket.append((name, param, grad))
+                cur_bytes = elem_bytes
+                first_device = grad.device
+                first_dtype = grad.dtype
+                continue
+
+            if grad.device != first_device or grad.dtype != first_dtype or (cur_bytes + elem_bytes) > BUCKET_BYTES:
+                flush_bucket()
+                first_device = grad.device
+                first_dtype = grad.dtype
+                cur_bucket.append((name, param, grad))
+                cur_bytes = elem_bytes
+            else:
+                cur_bucket.append((name, param, grad))
+                cur_bytes += elem_bytes
+
+        flush_bucket()
+
+        handles = []
+        # Process each bucket: concat -> prune -> all_reduce_sparse -> scatter back
+        for bucket in buckets:
+            views = [g.reshape(-1) for (_, _, g) in bucket]
+            if not views:
+                continue
+            bucket_flat = torch.cat(views, dim=0)
+
+            # Record pre-collective nonzero/total
+            try:
+                stats.setdefault("precollective_nonzero", 0)
+                stats.setdefault("precollective_total", 0)
+                stats["precollective_nonzero"] += int(torch.count_nonzero(bucket_flat).item())
+                stats["precollective_total"] += int(bucket_flat.numel())
+            except Exception:
+                pass
+
+            # Create a stable bucket key from parameter pointers so error-feedback persists
+            bucket_key = tuple(int(p.data_ptr()) for (_, p, _) in bucket)
+
+            if gradient_pruner is not None:
+                _, prune_timing = gradient_pruner.prune(bucket_flat, key=bucket_key, return_timing=True)
+                stats.setdefault("prune_timing_events", [])
+                stats["prune_timing_events"].append(prune_timing)
+
+            # Launch sparse all-reduce on the bucket buffer (in-place)
             handle = sparse_comms_mod.all_reduce_sparse(
-                grad,
+                bucket_flat,
                 group=data_parallel_group,
                 async_op=True,
             )
-            # print(f"Initiated sparse all-reduce for grad with {grad.numel()} elements ({grad.element_size() * grad.numel()} bytes)")
             if handle is not None:
-                handles.append(handle)
+                handles.append((handle, bucket))
 
-        for handle in handles:
+        # Wait for all collectives and scatter results back into original grads
+        for handle, bucket in handles:
             handle.wait()
+            # Reconstruct concatenated buffer from the (now reduced) per-param grads
+            views = [g.reshape(-1) for (_, _, g) in bucket]
+            if not views:
+                continue
+            bucket_flat_after = torch.cat(views, dim=0)
+            offset = 0
+            for (_, param, grad) in bucket:
+                n = grad.numel()
+                grad.copy_(bucket_flat_after[offset : offset + n].view_as(grad))
+                offset += n
     else:
         # Dense path: enqueue async all-reduces and join once.
         handles = []
@@ -474,6 +542,28 @@ def train_vgg16_distributed(topk_ratio=0.0,
 
             compute_end.record()
             compute_end.synchronize()
+
+            # If the sparse path returned Triton timing events, convert them
+            # to numeric milliseconds now that we've synchronized the GPU.
+            if sync_stats is not None and "prune_timing_events" in sync_stats:
+                # Ensure numeric keys exist
+                sync_stats.setdefault("prune_sample_ms", 0.0)
+                sync_stats.setdefault("prune_threshold_ms", 0.0)
+                sync_stats.setdefault("prune_kernel_ms", 0.0)
+                for timing in sync_stats.get("prune_timing_events", []):
+                    try:
+                        s_ms = float(timing["sample_start"].elapsed_time(timing["sample_end"]))
+                        t_ms = float(timing["threshold_start"].elapsed_time(timing["threshold_end"]))
+                        k_ms = float(timing["prune_start"].elapsed_time(timing["prune_end"]))
+                    except RuntimeError:
+                        # Event pairs not completed yet; skip this timing entry
+                        continue
+                    except Exception:
+                        # Unexpected error — raise to avoid silently masking issues
+                        raise
+                    sync_stats["prune_sample_ms"] += s_ms
+                    sync_stats["prune_threshold_ms"] += t_ms
+                    sync_stats["prune_kernel_ms"] += k_ms
 
             compute_time_ms = compute_start.elapsed_time(compute_end)
             sync_time_ms = sync_start.elapsed_time(sync_end)

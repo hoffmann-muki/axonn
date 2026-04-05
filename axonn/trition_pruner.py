@@ -192,10 +192,6 @@ class TritonGradientPruner:
         )
         prune_end.record()
 
-        sample_end.synchronize()
-        threshold_end.synchronize()
-        prune_end.synchronize()
-
         timing = {
             "sample_start": sample_start,
             "sample_end": sample_end,
