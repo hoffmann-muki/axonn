@@ -191,16 +191,16 @@ def sync_gradients_data_parallel(
                 continue
             bucket_flat = torch.cat(views, dim=0)
 
-            # Record pre-collective nonzero/total and per-bucket stats
+            # Record pre-prune and per-bucket size stats.
             try:
-                nz = int(torch.count_nonzero(bucket_flat).item())
+                pre_nz = int(torch.count_nonzero(bucket_flat).item())
                 tot = int(bucket_flat.numel())
                 stats.setdefault("precollective_nonzero", 0)
                 stats.setdefault("precollective_total", 0)
-                stats["precollective_nonzero"] += nz
+                stats["precollective_nonzero"] += pre_nz
                 stats["precollective_total"] += tot
                 stats.setdefault("buckets", [])
-                stats["buckets"].append({"bytes": int(bucket_flat.element_size() * bucket_flat.numel()), "nonzero": nz, "total": tot})
+                stats["buckets"].append({"bytes": int(bucket_flat.element_size() * bucket_flat.numel()), "pre_nonzero": pre_nz, "post_nonzero": None, "total": tot})
             except Exception:
                 pass
 
@@ -211,6 +211,18 @@ def sync_gradients_data_parallel(
                 _, prune_timing = gradient_pruner.prune(bucket_flat, key=bucket_key, return_timing=True)
                 stats.setdefault("prune_timing_events", [])
                 stats["prune_timing_events"].append(prune_timing)
+
+            # Record post-prune sparsity so the log reflects actual pruning effect.
+            try:
+                post_nz = int(torch.count_nonzero(bucket_flat).item())
+                stats.setdefault("postprune_nonzero", 0)
+                stats.setdefault("postprune_total", 0)
+                stats["postprune_nonzero"] += post_nz
+                stats["postprune_total"] += int(bucket_flat.numel())
+                if "buckets" in stats and stats["buckets"]:
+                    stats["buckets"][-1]["post_nonzero"] = post_nz
+            except Exception:
+                pass
 
             # Launch sparse all-reduce on the bucket buffer (in-place)
             handle = sparse_comms_mod.all_reduce_sparse(
@@ -607,17 +619,24 @@ def train_vgg16_distributed(topk_ratio=0.0,
                         pre_nz = sync_stats.get("precollective_nonzero") if sync_stats is not None else None
                         pre_tot = sync_stats.get("precollective_total") if sync_stats is not None else None
                         if pre_nz is not None and pre_tot is not None:
-                            sparsity_pct = 100.0 * (1.0 - float(pre_nz) / float(max(1, pre_tot)))
-                            print(f"    Pre-collective nonzeros: {pre_nz}/{pre_tot} (sparsity ~ {sparsity_pct:.2f}%)")
+                            pre_sparsity_pct = 100.0 * (1.0 - float(pre_nz) / float(max(1, pre_tot)))
+                            print(f"    Pre-prune nonzeros: {pre_nz}/{pre_tot} (density ~ {100.0 - pre_sparsity_pct:.2f}%, sparsity ~ {pre_sparsity_pct:.2f}%)")
+                        post_nz = sync_stats.get("postprune_nonzero") if sync_stats is not None else None
+                        post_tot = sync_stats.get("postprune_total") if sync_stats is not None else None
+                        if post_nz is not None and post_tot is not None:
+                            post_sparsity_pct = 100.0 * (1.0 - float(post_nz) / float(max(1, post_tot)))
+                            print(f"    Post-prune nonzeros: {post_nz}/{post_tot} (sparsity ~ {post_sparsity_pct:.2f}%)")
                         buckets = sync_stats.get("buckets") if sync_stats is not None else None
                         if buckets:
                             # Print a short summary: count, avg bucket bytes, avg sparsity
                             cnt = len(buckets)
                             avg_bytes = sum(b["bytes"] for b in buckets) / float(cnt)
-                            avg_nz = sum(b["nonzero"] for b in buckets) / float(cnt)
+                            avg_pre_nz = sum(b["pre_nonzero"] for b in buckets) / float(cnt)
                             avg_tot = sum(b["total"] for b in buckets) / float(cnt)
-                            avg_sparsity = 100.0 * (1.0 - (avg_nz / max(1.0, avg_tot)))
-                            print(f"    Buckets: {cnt}, avg_size={avg_bytes/1024.0:.1f}KB, avg_sparsity~{avg_sparsity:.2f}%")
+                            avg_pre_sparsity = 100.0 * (1.0 - (avg_pre_nz / max(1.0, avg_tot)))
+                            avg_post_nz = sum((b["post_nonzero"] if b["post_nonzero"] is not None else 0) for b in buckets) / float(cnt)
+                            avg_post_sparsity = 100.0 * (1.0 - (avg_post_nz / max(1.0, avg_tot)))
+                            print(f"    Buckets: {cnt}, avg_size={avg_bytes/1024.0:.1f}KB, pre_sparsity~{avg_pre_sparsity:.2f}%, post_sparsity~{avg_post_sparsity:.2f}%")
                     except Exception:
                         pass
 
