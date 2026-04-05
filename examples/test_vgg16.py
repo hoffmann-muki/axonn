@@ -63,17 +63,24 @@ def _load_sparse_comms():
     return _SPARSE_COMMS
 
 
+def _normalize_sample_rate_pct(value: float) -> float:
+    """Normalize a user-supplied sample rate to a percentage value."""
+    if value <= 1.0:
+        return value * 100.0
+    return value
+
+
 def _resolve_prune_sample_pct(prune_sample_pct: Optional[float]) -> tuple[float, str]:
-    """Resolve the pruning sample percentage and report where it came from."""
+    """Resolve the pruning sample rate as a percentage and report where it came from."""
     sample_pct_env = os.environ.get("AXONN_PRUNE_SAMPLE_PCT")
     if sample_pct_env is not None:
         try:
-            return float(sample_pct_env), "env:AXONN_PRUNE_SAMPLE_PCT"
+            return _normalize_sample_rate_pct(float(sample_pct_env)), "env:AXONN_PRUNE_SAMPLE_PCT"
         except Exception:
             pass
 
     if prune_sample_pct is not None:
-        return float(prune_sample_pct), "cli:--prune-sample-pct"
+        return _normalize_sample_rate_pct(float(prune_sample_pct)), "cli:--prune-sample-pct"
 
     return 10.0, "default:10.0"
 
@@ -570,7 +577,7 @@ def train_vgg16_distributed(topk_ratio=0.0,
 def main():
     parser = argparse.ArgumentParser(description="Train VGG16 on Caltech-256 with AxoNN")
     parser.add_argument("--topk", type=float, default=0.0, help="Fraction of gradients to keep via top-k sparsification (0 disables)")
-    parser.add_argument("--prune-sample-pct", type=float, default=None, help="Sample percent for TritonGradientPruner threshold estimation (0-100). Overrides AXONN_PRUNE_SAMPLE_PCT env var")
+    parser.add_argument("--prune-sample-pct", type=float, default=None, help="Sample rate for TritonGradientPruner threshold estimation; values <=1 are treated as fractions (0.01 -> 1%). Overrides AXONN_PRUNE_SAMPLE_PCT env var")
     parser.add_argument("--batch-size-per-gpu", type=int, default=32, help="Per-GPU micro-batch size")
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=None, help="Base learning rate (linear scaling if omitted)")
