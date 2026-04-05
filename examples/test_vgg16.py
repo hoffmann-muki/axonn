@@ -90,6 +90,11 @@ def _cuda_timing_event_pair():
     return torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
 
 
+def _resolve_grad_bucket_bytes() -> int:
+    """Resolve the gradient bucket target used by sparse-path bucketing and logs."""
+    return int(os.environ.get("AXONN_GRAD_BUCKET_BYTES", str(600 * 1024 * 1024)))
+
+
 def _collect_data_parallel_grads(model):
     """Return (name, parameter, grad) tuples reduced across AxoNN data-parallel group."""
     grads = []
@@ -140,7 +145,7 @@ def sync_gradients_data_parallel(
     if use_sparse and sparse_comms_mod is not None:
         # Bucket gradients to reduce number of prune kernels and collectives.
         # Buckets group tensors by device and dtype and aim for ~BUCKET_BYTES per bucket.
-        BUCKET_BYTES = int(os.environ.get("AXONN_GRAD_BUCKET_BYTES", str(600 * 1024 * 1024)))
+        BUCKET_BYTES = _resolve_grad_bucket_bytes()
         buckets = []
         cur_bucket = []
         cur_bytes = 0
@@ -277,7 +282,7 @@ def log_grad_message_sizes(model, sparse_comms_mod, use_sparse: bool) -> None:
         print("Sparse collectives unavailable — skipping gradient-size logging")
         return
 
-    bucket_bytes = int(os.environ.get("AXONN_GRAD_BUCKET_BYTES", str(8 * 1024 * 1024)))
+    bucket_bytes = _resolve_grad_bucket_bytes()
     est_buckets = max(1, (local_total + bucket_bytes - 1) // bucket_bytes)
     print(
         "Gradient message size (rank 0, dense-equivalent): "
