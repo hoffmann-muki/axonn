@@ -201,17 +201,16 @@ def log_grad_message_sizes(model, sparse_comms_mod, use_sparse: bool) -> None:
     except StopIteration:
         tensor_device = torch.device("cpu")
 
+    if not use_sparse or sparse_comms_mod is None:
+        if rank_in_group == 0:
+            print("Sparse collectives unavailable — skipping gradient-size logging")
+        return
+
     local = torch.tensor([local_total], dtype=torch.long, device=tensor_device)
-    if use_sparse and sparse_comms_mod is not None:
-        # use binder's all_gather_sparse when available
-        gathered = torch.empty(group_size, dtype=torch.long, device=tensor_device)
-        sparse_comms_mod.all_gather_sparse(local, gathered, group=data_parallel_group, async_op=False)
-        gathered_ints = [int(x.item()) for x in gathered]
-    else:
-        # Dense fallback using torch.distributed.all_gather
-        gathered_list = [torch.zeros(1, dtype=torch.long, device=tensor_device) for _ in range(group_size)]
-        dist.all_gather(gathered_list, local, group=data_parallel_group)
-        gathered_ints = [int(x.item()) for x in gathered_list]
+    # use binder's all_gather_sparse when available
+    gathered = torch.empty(group_size, dtype=torch.long, device=tensor_device)
+    sparse_comms_mod.all_gather_sparse(local, gathered, group=data_parallel_group, async_op=False)
+    gathered_ints = [int(x.item()) for x in gathered]
 
     if rank_in_group == 0:
         print("Per-data-parallel-rank all-reduce byte counts (approx):")
