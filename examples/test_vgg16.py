@@ -84,7 +84,7 @@ def _cuda_timing_event_pair():
 
 
 def _collect_data_parallel_grads(model):
-    """Return gradients that are reduced across AxoNN data-parallel group."""
+    """Return (name, parameter, grad) tuples reduced across AxoNN data-parallel group."""
     grads = []
     for name, p in model.named_parameters():
         if not p.requires_grad:
@@ -100,12 +100,18 @@ def _collect_data_parallel_grads(model):
                     f"Tensor-parallel parameter '{name}' is missing needs_depth_parallel_gradient_sync"
                 )
 
-        grads.append((name, grad))
+        grads.append((name, p, grad))
     return grads
 
 
 @torch.no_grad()
-def sync_gradients_data_parallel(model, sparse_comms_mod, use_sparse: bool, mean: bool = True) -> None:
+def sync_gradients_data_parallel(
+    model,
+    sparse_comms_mod,
+    use_sparse: bool,
+    mean: bool = True,
+    gradient_pruner=None,
+):
     """Synchronize gradients across AxoNN data-parallel ranks using sparse AR or dense collectives.
 
     When `use_sparse` is True and `sparse_comms_mod` is available this uses
@@ -118,10 +124,21 @@ def sync_gradients_data_parallel(model, sparse_comms_mod, use_sparse: bool, mean
     data_parallel_group = ax.comm_handle.data_parallel_group
     group_size = ax.comm_handle.G_data
     grads = _collect_data_parallel_grads(model)
+    stats = {
+        "prune_sample_ms": 0.0,
+        "prune_threshold_ms": 0.0,
+        "prune_kernel_ms": 0.0,
+    }
 
     if use_sparse and sparse_comms_mod is not None:
         handles = []
-        for _, grad in grads:
+        for _, param, grad in grads:
+            if gradient_pruner is not None:
+                _, prune_timing = gradient_pruner.prune(grad, key=param.data_ptr(), return_timing=True)
+                stats["prune_sample_ms"] += prune_timing["sample_start"].elapsed_time(prune_timing["sample_end"])
+                stats["prune_threshold_ms"] += prune_timing["threshold_start"].elapsed_time(prune_timing["threshold_end"])
+                stats["prune_kernel_ms"] += prune_timing["prune_start"].elapsed_time(prune_timing["prune_end"])
+
             handle = sparse_comms_mod.all_reduce_sparse(
                 grad,
                 group=data_parallel_group,
@@ -134,15 +151,21 @@ def sync_gradients_data_parallel(model, sparse_comms_mod, use_sparse: bool, mean
         for handle in handles:
             handle.wait()
     else:
-        # Dense fallback using torch.distributed
-        # print("Using dense all-reduce for gradients")
-        for _, grad in grads:
-            dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=data_parallel_group)
+        # Dense path: enqueue async all-reduces and join once.
+        handles = []
+        for _, _, grad in grads:
+            handle = dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=data_parallel_group, async_op=True)
+            if handle is not None:
+                handles.append(handle)
+        for handle in handles:
+            handle.wait()
 
     if mean and group_size > 1:
         scale = 1.0 / float(group_size)
-        for _, grad in grads:
+        for _, _, grad in grads:
             grad.mul_(scale)
+
+    return stats
 
 def log_grad_message_sizes(model, sparse_comms_mod, use_sparse: bool) -> None:
     """Compute and report per-data-parallel-rank gradient-message sizes.
@@ -169,7 +192,7 @@ def log_grad_message_sizes(model, sparse_comms_mod, use_sparse: bool) -> None:
     def bytes_of(tensor: torch.Tensor) -> int:
         return int(tensor.numel() * tensor.element_size())
 
-    local_total = sum(bytes_of(grad) for _, grad in grads)
+    local_total = sum(bytes_of(grad) for _, _, grad in grads)
 
     # Gather per-group-rank totals using AxoNN's data-parallel group
     try:
@@ -422,21 +445,22 @@ def train_vgg16_distributed(topk_ratio=0.0,
                     total_norm += param_norm.item() ** 2
             total_norm = total_norm ** 0.5
 
-            if gradient_pruner is not None:
-                prune_timing_records = []
-                for param in model.parameters():
-                    if param.grad is None:
-                        continue
-                    _, prune_timing = gradient_pruner.prune(param.grad, key=param.data_ptr(), return_timing=True)
-                    prune_timing_records.append(prune_timing)
-            else:
-                prune_timing_records = []
-
-            # synchronize gradients across data-parallel ranks
-            allreduce_start, allreduce_end = _cuda_timing_event_pair()
-            allreduce_start.record()
-            sync_gradients_data_parallel(model, sparse_comms_mod, use_sparse=use_sparse, mean=True)
-            allreduce_end.record()
+            sync_start, sync_end = _cuda_timing_event_pair()
+            sync_start.record()
+            sync_stats = sync_gradients_data_parallel(
+                model,
+                sparse_comms_mod,
+                use_sparse=use_sparse,
+                mean=True,
+                gradient_pruner=gradient_pruner,
+            )
+            if sync_stats is None:
+                sync_stats = {
+                    "prune_sample_ms": 0.0,
+                    "prune_threshold_ms": 0.0,
+                    "prune_kernel_ms": 0.0,
+                }
+            sync_end.record()
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
@@ -446,17 +470,14 @@ def train_vgg16_distributed(topk_ratio=0.0,
             compute_end.synchronize()
 
             compute_time_ms = compute_start.elapsed_time(compute_end)
-            allreduce_time_ms = allreduce_start.elapsed_time(allreduce_end)
-            if prune_timing_records:
-                prune_sample_time_ms = sum(t["sample_start"].elapsed_time(t["sample_end"]) for t in prune_timing_records)
-                prune_threshold_time_ms = sum(t["threshold_start"].elapsed_time(t["threshold_end"]) for t in prune_timing_records)
-                prune_kernel_time_ms = sum(t["prune_start"].elapsed_time(t["prune_end"]) for t in prune_timing_records)
-            else:
-                prune_sample_time_ms = 0.0
-                prune_threshold_time_ms = 0.0
-                prune_kernel_time_ms = 0.0
+            sync_time_ms = sync_start.elapsed_time(sync_end)
+
+            prune_sample_time_ms = float(sync_stats["prune_sample_ms"])
+            prune_threshold_time_ms = float(sync_stats["prune_threshold_ms"])
+            prune_kernel_time_ms = float(sync_stats["prune_kernel_ms"])
 
             prune_time_ms = prune_sample_time_ms + prune_threshold_time_ms + prune_kernel_time_ms
+            allreduce_time_ms = max(0.0, sync_time_ms - prune_time_ms)
             compute_rest_time_ms = max(0.0, compute_time_ms - prune_time_ms - allreduce_time_ms)
 
             run_compute_time_ms += compute_time_ms
