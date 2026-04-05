@@ -186,12 +186,16 @@ def sync_gradients_data_parallel(
                 continue
             bucket_flat = torch.cat(views, dim=0)
 
-            # Record pre-collective nonzero/total
+            # Record pre-collective nonzero/total and per-bucket stats
             try:
+                nz = int(torch.count_nonzero(bucket_flat).item())
+                tot = int(bucket_flat.numel())
                 stats.setdefault("precollective_nonzero", 0)
                 stats.setdefault("precollective_total", 0)
-                stats["precollective_nonzero"] += int(torch.count_nonzero(bucket_flat).item())
-                stats["precollective_total"] += int(bucket_flat.numel())
+                stats["precollective_nonzero"] += nz
+                stats["precollective_total"] += tot
+                stats.setdefault("buckets", [])
+                stats["buckets"].append({"bytes": int(bucket_flat.element_size() * bucket_flat.numel()), "nonzero": nz, "total": tot})
             except Exception:
                 pass
 
@@ -602,6 +606,25 @@ def train_vgg16_distributed(topk_ratio=0.0,
                 current_lr = optimizer.param_groups[0]['lr']
                 print(f"  Batch {batch_idx+1}: loss = {batch_loss:.6f} | LR = {current_lr:.6e} | grad_norm = {total_norm:.6f}")
                 print(f"    Timing (ms, CUDA events): allreduce={allreduce_time_ms:.6f}, prune={prune_time_ms:.6f}, compute={compute_rest_time_ms:.6f}")
+                # If requested, print pre-collective gradient-message sizes and bucket sparsity
+                if log_grad_messages:
+                    try:
+                        pre_nz = sync_stats.get("precollective_nonzero") if sync_stats is not None else None
+                        pre_tot = sync_stats.get("precollective_total") if sync_stats is not None else None
+                        if pre_nz is not None and pre_tot is not None:
+                            sparsity_pct = 100.0 * (1.0 - float(pre_nz) / float(max(1, pre_tot)))
+                            print(f"    Pre-collective nonzeros: {pre_nz}/{pre_tot} (sparsity ~ {sparsity_pct:.2f}%)")
+                        buckets = sync_stats.get("buckets") if sync_stats is not None else None
+                        if buckets:
+                            # Print a short summary: count, avg bucket bytes, avg sparsity
+                            cnt = len(buckets)
+                            avg_bytes = sum(b["bytes"] for b in buckets) / float(cnt)
+                            avg_nz = sum(b["nonzero"] for b in buckets) / float(cnt)
+                            avg_tot = sum(b["total"] for b in buckets) / float(cnt)
+                            avg_sparsity = 100.0 * (1.0 - (avg_nz / max(1.0, avg_tot)))
+                            print(f"    Buckets: {cnt}, avg_size={avg_bytes/1024.0:.1f}KB, avg_sparsity~{avg_sparsity:.2f}%")
+                    except Exception:
+                        pass
 
         if rank == 0:
             avg_loss = epoch_loss / max(1, len(train_dataloader))

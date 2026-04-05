@@ -135,5 +135,6 @@ srun -N $NNODES -n $NNODES --ntasks-per-node=1 \
   --batch-size-per-gpu 2 \
   --epochs 2 \
     --topk "$TOPK" \
+    --log-grad-messages \
     --sparse-collectives \
   --pretrained | tee logs/caltech_256_${NNODES}_${SPARSITY}_${SAMPLE_PCT}_${NCHANNELS}.log
