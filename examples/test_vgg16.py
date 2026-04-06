@@ -251,12 +251,20 @@ def sync_gradients_data_parallel(
         # collectives are measured through the same timing infrastructure.
         handles = []
         for _, _, grad in grads:
-            handle = sparse_comms_mod.all_reduce_sparse(
-                grad,
-                group=data_parallel_group,
-                async_op=True,
-                timer=_ALLREDUCE_TIMER,
-            )
+            if sparse_comms_mod is not None:
+                handle = sparse_comms_mod.all_reduce_sparse(
+                    grad,
+                    group=data_parallel_group,
+                    async_op=True,
+                    timer=_ALLREDUCE_TIMER,
+                )
+            else:
+                handle = dist.all_reduce(
+                    grad,
+                    op=dist.ReduceOp.SUM,
+                    group=data_parallel_group,
+                    async_op=True,
+                )
             if handle is not None:
                 handles.append(handle)
         for handle in handles:
@@ -485,6 +493,7 @@ def train_vgg16_distributed(topk_ratio=0.0,
     run_prune_threshold_time_ms = 0.0
     run_prune_kernel_time_ms = 0.0
     run_allreduce_time_ms = 0.0
+    run_sync_overhead_time_ms = 0.0
     run_compute_time_ms = 0.0
 
     # Training loop
@@ -496,6 +505,7 @@ def train_vgg16_distributed(topk_ratio=0.0,
         epoch_prune_threshold_time_ms = 0.0
         epoch_prune_kernel_time_ms = 0.0
         epoch_allreduce_time_ms = 0.0
+        epoch_sync_overhead_time_ms = 0.0
         epoch_compute_time_ms = 0.0
         train_correct = 0
         train_total = 0
@@ -529,6 +539,7 @@ def train_vgg16_distributed(topk_ratio=0.0,
                     total_norm += param_norm.item() ** 2
             total_norm = total_norm ** 0.5
 
+            sync_wall_start = time.perf_counter()
             sync_stats = sync_gradients_data_parallel(
                 model,
                 sparse_comms_mod,
@@ -536,6 +547,7 @@ def train_vgg16_distributed(topk_ratio=0.0,
                 mean=True,
                 gradient_pruner=gradient_pruner,
             )
+            sync_wall_ms = (time.perf_counter() - sync_wall_start) * 1000.0
             if sync_stats is None:
                 sync_stats = {
                     "prune_sample_ms": 0.0,
@@ -572,7 +584,7 @@ def train_vgg16_distributed(topk_ratio=0.0,
                     sync_stats["prune_threshold_ms"] += t_ms
                     sync_stats["prune_kernel_ms"] += k_ms
 
-            compute_time_ms = (time.perf_counter() - compute_start) * 1000.0
+            batch_total_time_ms = (time.perf_counter() - compute_start) * 1000.0
 
             prune_sample_time_ms = float(sync_stats["prune_sample_ms"])
             prune_threshold_time_ms = float(sync_stats["prune_threshold_ms"])
@@ -584,20 +596,23 @@ def train_vgg16_distributed(topk_ratio=0.0,
                 allreduce_time_ms = _ALLREDUCE_TIMER.flush_and_get_ms()
             else:
                 allreduce_time_ms = 0.0
-            compute_rest_time_ms = max(0.0, compute_time_ms - prune_time_ms - allreduce_time_ms)
+            sync_overhead_time_ms = max(0.0, sync_wall_ms - prune_time_ms - allreduce_time_ms)
+            compute_rest_time_ms = max(0.0, batch_total_time_ms - sync_wall_ms)
 
-            run_compute_time_ms += compute_time_ms
+            run_compute_time_ms += compute_rest_time_ms
             run_prune_time_ms += prune_time_ms
             run_prune_sample_time_ms += prune_sample_time_ms
             run_prune_threshold_time_ms += prune_threshold_time_ms
             run_prune_kernel_time_ms += prune_kernel_time_ms
             run_allreduce_time_ms += allreduce_time_ms
-            epoch_compute_time_ms += compute_time_ms
+            run_sync_overhead_time_ms += sync_overhead_time_ms
+            epoch_compute_time_ms += compute_rest_time_ms
             epoch_prune_time_ms += prune_time_ms
             epoch_prune_sample_time_ms += prune_sample_time_ms
             epoch_prune_threshold_time_ms += prune_threshold_time_ms
             epoch_prune_kernel_time_ms += prune_kernel_time_ms
             epoch_allreduce_time_ms += allreduce_time_ms
+            epoch_sync_overhead_time_ms += sync_overhead_time_ms
 
             batch_loss = float(loss.item())
             epoch_loss += batch_loss
@@ -611,7 +626,7 @@ def train_vgg16_distributed(topk_ratio=0.0,
             if rank == 0:
                 current_lr = optimizer.param_groups[0]['lr']
                 print(f"  Batch {batch_idx+1}: loss = {batch_loss:.6f} | LR = {current_lr:.6e} | grad_norm = {total_norm:.6f}")
-                print(f"    Timing (ms, CUDA events): allreduce={allreduce_time_ms:.6f}, prune={prune_time_ms:.6f}, compute={compute_rest_time_ms:.6f}")
+                print(f"    Timing (ms, CUDA events): allreduce={allreduce_time_ms:.6f}, prune={prune_time_ms:.6f}, sync_other={sync_overhead_time_ms:.6f}, compute={compute_rest_time_ms:.6f}")
                 # If requested, print pre-collective gradient-message sizes and bucket sparsity
                 if log_grad_messages:
                     try:
@@ -643,7 +658,7 @@ def train_vgg16_distributed(topk_ratio=0.0,
             avg_loss = epoch_loss / max(1, len(train_dataloader))
             train_acc = 100.0 * train_correct / max(1, train_total)
             print(f"Epoch {epoch+1}: Average loss = {avg_loss:.4f}, Train Acc = {train_acc:.2f}%, Duration = {time.time()-epoch_start:.2f}s")
-            print(f"Epoch timing summary (ms, CUDA events): allreduce_total={epoch_allreduce_time_ms:.6f}, prune_total={epoch_prune_time_ms:.6f}, compute_total={max(0.0, epoch_compute_time_ms-epoch_prune_time_ms-epoch_allreduce_time_ms):.6f}")
+            print(f"Epoch timing summary (ms, CUDA events): allreduce_total={epoch_allreduce_time_ms:.6f}, prune_total={epoch_prune_time_ms:.6f}, sync_other_total={epoch_sync_overhead_time_ms:.6f}, compute_total={epoch_compute_time_ms:.6f}")
             if gradient_pruner is not None:
                 print(
                     f"Epoch prune breakdown (ms, CUDA events): sample_total={epoch_prune_sample_time_ms:.6f}, "
@@ -687,7 +702,8 @@ def train_vgg16_distributed(topk_ratio=0.0,
             "Run timing summary (ms, CUDA events): "
             f"allreduce_total={run_allreduce_time_ms:.6f}, "
             f"prune_total={run_prune_time_ms:.6f}, "
-            f"compute_total={max(0.0, run_compute_time_ms-run_prune_time_ms-run_allreduce_time_ms):.6f}"
+            f"sync_other_total={run_sync_overhead_time_ms:.6f}, "
+            f"compute_total={run_compute_time_ms:.6f}"
         )
         if gradient_pruner is not None:
             print(
