@@ -249,10 +249,8 @@ def sync_gradients_data_parallel(
     else:
         # Dense path: use the native dense all-reduce and time it with the
         # shared op timer so the summary still reports dense collective time.
-        handles = []
         for _, _, grad in grads:
-            timed = _ALLREDUCE_TIMER is not None
-            if timed:
+            if _ALLREDUCE_TIMER is not None:
                 _ALLREDUCE_TIMER.start()
             handle = dist.all_reduce(
                 grad,
@@ -261,12 +259,8 @@ def sync_gradients_data_parallel(
                 async_op=True,
             )
             if handle is not None:
-                handles.append((handle, timed))
-            elif timed:
-                _ALLREDUCE_TIMER.stop()
-        for handle, timed in handles:
-            handle.wait()
-            if timed:
+                handle.wait()
+            if _ALLREDUCE_TIMER is not None:
                 _ALLREDUCE_TIMER.stop()
 
     if mean and group_size > 1:
