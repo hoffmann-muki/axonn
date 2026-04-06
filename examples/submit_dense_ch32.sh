@@ -60,6 +60,7 @@ export AXONN_PRUNE_RS=0
 export AXONN_PRUNE_AR=1
 export AXONN_PRUNE_SPARSITY=$SPARSITY
 export AXONN_PRUNE_SAMPLE_PCT=$SAMPLE_PCT
+export AXONN_TIME_OPS=1
 export SPARSE_COMMS_LOG_SPARSITY=0
 
 # Avoid enabling NCCLX shim/perf logging knobs that can require unavailable

@@ -35,6 +35,7 @@ from torch.utils.data import DataLoader
 
 from axonn import axonn as ax
 from axonn.trition_pruner import TritonGradientPruner
+from axonn.op_timers import allreduce_timer as _ALLREDUCE_TIMER
 
 _SPARSE_COMMS = None
 
@@ -83,11 +84,6 @@ def _resolve_prune_sample_pct(prune_sample_pct: Optional[float]) -> tuple[float,
         return _normalize_sample_rate_pct(float(prune_sample_pct)), "cli:--prune-sample-pct"
 
     return 10.0, "default:10.0"
-
-
-def _cuda_timing_event_pair():
-    """Create a CUDA start/end event pair for elapsed-time measurement."""
-    return torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
 
 
 def _resolve_grad_bucket_bytes() -> int:
@@ -143,6 +139,9 @@ def sync_gradients_data_parallel(
     }
 
     if use_sparse and sparse_comms_mod is not None:
+        if _ALLREDUCE_TIMER is None:
+            raise RuntimeError("AXONN_TIME_OPS=1 is required for sparse collective timing")
+
         # Bucket gradients to reduce number of prune kernels and collectives.
         # Buckets group tensors by device and dtype and aim for ~BUCKET_BYTES per bucket.
         BUCKET_BYTES = _resolve_grad_bucket_bytes()
@@ -229,6 +228,7 @@ def sync_gradients_data_parallel(
                 bucket_flat,
                 group=data_parallel_group,
                 async_op=True,
+                timer=_ALLREDUCE_TIMER,
             )
             if handle is not None:
                 handles.append((handle, bucket))
@@ -506,8 +506,7 @@ def train_vgg16_distributed(topk_ratio=0.0,
         for batch_idx, (x, y) in enumerate(tqdm(train_dataloader, disable=(rank != 0), desc=f"Epoch {epoch+1}/{num_epochs}")):
             x, y = x.cuda(), y.cuda()
 
-            compute_start, compute_end = _cuda_timing_event_pair()
-            compute_start.record()
+            compute_start = time.perf_counter()
 
             optimizer.zero_grad()
             logits = model(x)
@@ -530,8 +529,6 @@ def train_vgg16_distributed(topk_ratio=0.0,
                     total_norm += param_norm.item() ** 2
             total_norm = total_norm ** 0.5
 
-            sync_start, sync_end = _cuda_timing_event_pair()
-            sync_start.record()
             sync_stats = sync_gradients_data_parallel(
                 model,
                 sparse_comms_mod,
@@ -545,14 +542,10 @@ def train_vgg16_distributed(topk_ratio=0.0,
                     "prune_threshold_ms": 0.0,
                     "prune_kernel_ms": 0.0,
                 }
-            sync_end.record()
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
             scheduler.step()
-
-            compute_end.record()
-            compute_end.synchronize()
 
             # If the sparse path returned Triton timing events, convert them
             # to numeric milliseconds now that we've synchronized the GPU.
@@ -576,15 +569,18 @@ def train_vgg16_distributed(topk_ratio=0.0,
                     sync_stats["prune_threshold_ms"] += t_ms
                     sync_stats["prune_kernel_ms"] += k_ms
 
-            compute_time_ms = compute_start.elapsed_time(compute_end)
-            sync_time_ms = sync_start.elapsed_time(sync_end)
+            compute_time_ms = (time.perf_counter() - compute_start) * 1000.0
 
             prune_sample_time_ms = float(sync_stats["prune_sample_ms"])
             prune_threshold_time_ms = float(sync_stats["prune_threshold_ms"])
             prune_kernel_time_ms = float(sync_stats["prune_kernel_ms"])
 
             prune_time_ms = prune_sample_time_ms + prune_threshold_time_ms + prune_kernel_time_ms
-            allreduce_time_ms = max(0.0, sync_time_ms - prune_time_ms)
+            if use_sparse:
+                _ALLREDUCE_TIMER.flush_and_get_ms()
+                allreduce_time_ms = _ALLREDUCE_TIMER.flush_and_get_ms()
+            else:
+                allreduce_time_ms = 0.0
             compute_rest_time_ms = max(0.0, compute_time_ms - prune_time_ms - allreduce_time_ms)
 
             run_compute_time_ms += compute_time_ms
