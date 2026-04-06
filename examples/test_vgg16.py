@@ -247,28 +247,27 @@ def sync_gradients_data_parallel(
                 grad.copy_(bucket_flat_after[offset : offset + n].view_as(grad))
                 offset += n
     else:
-        # Dense path: use the same timer-enabled API so dense and sparse
-        # collectives are measured through the same timing infrastructure.
+        # Dense path: use the native dense all-reduce and time it with the
+        # shared op timer so the summary still reports dense collective time.
         handles = []
         for _, _, grad in grads:
-            if sparse_comms_mod is not None:
-                handle = sparse_comms_mod.all_reduce_sparse(
-                    grad,
-                    group=data_parallel_group,
-                    async_op=True,
-                    timer=_ALLREDUCE_TIMER,
-                )
-            else:
-                handle = dist.all_reduce(
-                    grad,
-                    op=dist.ReduceOp.SUM,
-                    group=data_parallel_group,
-                    async_op=True,
-                )
+            timed = _ALLREDUCE_TIMER is not None
+            if timed:
+                _ALLREDUCE_TIMER.start()
+            handle = dist.all_reduce(
+                grad,
+                op=dist.ReduceOp.SUM,
+                group=data_parallel_group,
+                async_op=True,
+            )
             if handle is not None:
-                handles.append(handle)
-        for handle in handles:
+                handles.append((handle, timed))
+            elif timed:
+                _ALLREDUCE_TIMER.stop()
+        for handle, timed in handles:
             handle.wait()
+            if timed:
+                _ALLREDUCE_TIMER.stop()
 
     if mean and group_size > 1:
         scale = 1.0 / float(group_size)
