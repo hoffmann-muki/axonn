@@ -34,7 +34,7 @@ from torch.optim.lr_scheduler import LinearLR, SequentialLR, CosineAnnealingLR
 from torch.utils.data import DataLoader
 
 from axonn import axonn as ax
-from axonn.trition_pruner import TritonGradientPruner
+from axonn.triton_pruner import TritonGradientPruner
 from axonn.op_timers import allreduce_timer as _ALLREDUCE_TIMER
 
 _SPARSE_COMMS = None
