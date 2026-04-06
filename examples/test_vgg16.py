@@ -503,6 +503,9 @@ def train_vgg16_distributed(topk_ratio=0.0,
         train_correct = 0
         train_total = 0
 
+        if use_sparse:
+            _ALLREDUCE_TIMER.reset()
+
         for batch_idx, (x, y) in enumerate(tqdm(train_dataloader, disable=(rank != 0), desc=f"Epoch {epoch+1}/{num_epochs}")):
             x, y = x.cuda(), y.cuda()
 
@@ -546,6 +549,9 @@ def train_vgg16_distributed(topk_ratio=0.0,
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
             scheduler.step()
+
+            # Ensure CUDA events are complete before reading elapsed_time().
+            torch.cuda.synchronize()
 
             # If the sparse path returned Triton timing events, convert them
             # to numeric milliseconds now that we've synchronized the GPU.
