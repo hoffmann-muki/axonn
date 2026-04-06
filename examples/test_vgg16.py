@@ -247,10 +247,16 @@ def sync_gradients_data_parallel(
                 grad.copy_(bucket_flat_after[offset : offset + n].view_as(grad))
                 offset += n
     else:
-        # Dense path: enqueue async all-reduces and join once.
+        # Dense path: use the same timer-enabled API so dense and sparse
+        # collectives are measured through the same timing infrastructure.
         handles = []
         for _, _, grad in grads:
-            handle = dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=data_parallel_group, async_op=True)
+            handle = sparse_comms_mod.all_reduce_sparse(
+                grad,
+                group=data_parallel_group,
+                async_op=True,
+                timer=_ALLREDUCE_TIMER,
+            )
             if handle is not None:
                 handles.append(handle)
         for handle in handles:
@@ -264,22 +270,13 @@ def sync_gradients_data_parallel(
     return stats
 
 def log_grad_message_sizes(model, sparse_comms_mod, use_sparse: bool) -> None:
-    """Compute and report rank-0 gradient-message size guidance for bucketing.
-
-    This reports the dense-equivalent gradient bytes on rank 0 only,
-    along with an estimated bucket count from ``AXONN_GRAD_BUCKET_BYTES``.
-    It intentionally avoids per-rank prints to keep logs concise.
-    """
-    # Classify gradients the same way AxoNN's `sync_gradients` does, so
-    # we count only those gradients that will be reduced over the
-    # data-parallel group.
+    """Compute and report rank-0 gradient-message size guidance for bucketing."""
     if not (dist.is_initialized() and hasattr(ax, "comm_handle") and getattr(ax.comm_handle, "data_parallel_group", None) is not None):
         if dist.is_initialized() and dist.get_rank() == 0:
             print("AxoNN data-parallel group unavailable — skipping gradient-size logging")
         return
 
     rank_in_group = ax.comm_handle.data_parallel_rank
-
     if rank_in_group != 0:
         return
 
@@ -392,7 +389,7 @@ def train_vgg16_distributed(topk_ratio=0.0,
     use_sparse = any(sparse_modes.values())
 
     sparse_comms_mod = None
-    if use_sparse:
+    if use_sparse or _ALLREDUCE_TIMER is not None:
         try:
             sparse_comms_mod = _load_sparse_comms()
         except Exception as exc:
@@ -503,7 +500,7 @@ def train_vgg16_distributed(topk_ratio=0.0,
         train_correct = 0
         train_total = 0
 
-        if use_sparse:
+        if _ALLREDUCE_TIMER is not None:
             _ALLREDUCE_TIMER.reset()
 
         for batch_idx, (x, y) in enumerate(tqdm(train_dataloader, disable=(rank != 0), desc=f"Epoch {epoch+1}/{num_epochs}")):
@@ -582,7 +579,7 @@ def train_vgg16_distributed(topk_ratio=0.0,
             prune_kernel_time_ms = float(sync_stats["prune_kernel_ms"])
 
             prune_time_ms = prune_sample_time_ms + prune_threshold_time_ms + prune_kernel_time_ms
-            if use_sparse:
+            if _ALLREDUCE_TIMER is not None:
                 _ALLREDUCE_TIMER.flush_and_get_ms()
                 allreduce_time_ms = _ALLREDUCE_TIMER.flush_and_get_ms()
             else:
