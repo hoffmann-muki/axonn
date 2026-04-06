@@ -43,12 +43,12 @@ class _CudaOpTimer:
 
     def flush_and_get_ms(self) -> float:
         total = 0.0
-        for s, e in self._pending:
+        for s, e in self._pending + self._current:
             try:
                 total += s.elapsed_time(e)
             except RuntimeError:
                 pass
-        self._pending = self._current
+        self._pending = []
         self._current = []
         return total
 

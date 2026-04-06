@@ -592,7 +592,6 @@ def train_vgg16_distributed(topk_ratio=0.0,
 
             prune_time_ms = prune_sample_time_ms + prune_threshold_time_ms + prune_kernel_time_ms
             if _ALLREDUCE_TIMER is not None:
-                _ALLREDUCE_TIMER.flush_and_get_ms()
                 allreduce_time_ms = _ALLREDUCE_TIMER.flush_and_get_ms()
             else:
                 allreduce_time_ms = 0.0
