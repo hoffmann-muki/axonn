@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --nodes=2
-#SBATCH --ntasks-per-node=4
+#SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --constraint="gpu\&hbm40g"
 #SBATCH --qos=regular
